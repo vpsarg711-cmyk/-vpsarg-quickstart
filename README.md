@@ -24,12 +24,11 @@ que las unidades correspondan a los programas y puertos esperados.
 
 ## Instalar desde una VPS
 
-Reemplazá `TU_USUARIO` por tu nombre de usuario real de GitHub. El repositorio
-debe estar publicado y contener `install.sh` en la rama `main`.
+El repositorio oficial de VPS ARG QuickStart es vpsarg711-cmyk/vpsarg-quickstart. Debe estar publicado y contener install.sh en la rama main.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/TU_USUARIO/vpsarg-quickstart/main/install.sh -o /tmp/vpsarg-install.sh
-sudo bash /tmp/vpsarg-install.sh instalar
+curl -fsSL https://raw.githubusercontent.com/vpsarg711-cmyk/-vpsarg-quickstart/main/install.sh -o /tmp/vpsarg-install.sh
+sudo bash /tmp/vpsarg-install.sh
 ```
 
 Este comando instala el comando de administración en `/usr/local/sbin`.
