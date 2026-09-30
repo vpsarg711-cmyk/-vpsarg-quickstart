@@ -27,7 +27,7 @@ if ! bash -n "$TMP"; then
 fi
 
 echo "Instalando el comando..."
-bash "$TMP" install
+bash "$TMP" instalar
 
 echo "Instalación del comando finalizada."
 echo "Comprobá los servicios con:"
