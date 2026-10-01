@@ -1,63 +1,54 @@
 # VPS ARG QuickStart
 
-Herramienta mínima para administrar los servicios systemd `pdirect-c` y
-`udpgw-7300` en una VPS Ubuntu.
+Instalador inicial para Ubuntu que compila e instala **BadVPN UDPGW** y agrega un controlador sencillo para administrar su servicio systemd.
 
-## Estado de esta versión
+## Alcance de esta versión
 
-**Versión inicial: control de servicios existentes.** Instala el comando
-`vpsarg-puertos`, pero **no instala PDirect-C ni UDPGW**, ni crea sus unidades
-systemd o configuraciones. En una VPS nueva, primero deben instalarse y
-configurarse esos servicios. No ejecutes comandos de inicio hasta verificar
-que las unidades correspondan a los programas y puertos esperados.
+- Instala BadVPN UDPGW y crea `udpgw-7300.service`.
+- Configura el controlador `vpsarg-puertos`.
+- El servicio escucha en **TCP/7300**.
+- No modifica SSH, el firewall, usuarios de Servex ni otros servicios.
+- Si encuentra ciertos archivos o una unidad del mismo nombre, cancela antes de realizar cambios para evitar sobrescribirlos.
+- No instala PDirect-C, HCR, VT Proxy ni BHTTP.
 
-## Publicar en GitHub
+El instalador requiere acceso root y conexión a Internet. Descarga el código fuente de BadVPN desde su repositorio upstream y lo compila en la VPS. Revisá el código y las licencias de los componentes antes de utilizarlo.
 
-1. En GitHub, creá un repositorio nuevo llamado `vpsarg-quickstart`.
-2. Elegí **Public**. No agregues contraseñas, tokens, claves privadas ni archivos
-   de configuración de tus servidores.
-3. En tu computadora, descomprimí esta carpeta o subí estos archivos:
-   - `install.sh`
-   - `vpsarg-puertos.sh`
-   - `README.md`
-4. Hacé el primer commit en la rama `main`.
+## Instalación
 
-## Instalar desde una VPS
-
-El repositorio oficial de VPS ARG QuickStart es vpsarg711-cmyk/vpsarg-quickstart. Debe estar publicado y contener install.sh en la rama main.
+Revisá el contenido de `install.sh` antes de ejecutarlo. Desde una VPS Ubuntu nueva, ejecutá:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/vpsarg711-cmyk/-vpsarg-quickstart/main/install.sh -o /tmp/vpsarg-install.sh
 sudo bash /tmp/vpsarg-install.sh
 ```
 
-Este comando instala el comando de administración en `/usr/local/sbin`.
-No instala los binarios de PDirect-C ni UDPGW.
+El instalador no debe ejecutarse en una VPS que ya tenga configurado `udpgw-7300.service`, `/opt/badvpn/badvpn-udpgw`, `/etc/vpsarg-servicios.conf` o `/usr/local/sbin/vpsarg-puertos`: en esos casos se cancela para evitar sobrescribirlos.
 
-## Comandos
+## Comandos del controlador
 
 ```bash
+sudo vpsarg-puertos estado
 sudo vpsarg-puertos iniciar
 sudo vpsarg-puertos detener
 sudo vpsarg-puertos reiniciar
-sudo vpsarg-puertos estado
 sudo vpsarg-puertos habilitar
 sudo vpsarg-puertos deshabilitar
 ```
 
-- `iniciar`: inicia ambos servicios.
-- `detener`: detiene ambos servicios.
-- `reiniciar`: reinicia ambos servicios.
-- `estado`: muestra el estado y los puertos en escucha.
-- `habilitar`: habilita el inicio automático y los inicia ahora.
-- `deshabilitar`: los detiene y desactiva el inicio automático.
+- `estado`: muestra el estado del servicio y los puertos en escucha.
+- `iniciar`: inicia el servicio.
+- `detener`: detiene el servicio.
+- `reiniciar`: reinicia el servicio.
+- `habilitar`: habilita el inicio automático y lo inicia ahora.
+- `deshabilitar`: lo detiene y desactiva el inicio automático.
+
+La lista de unidades administradas está en `/etc/vpsarg-servicios.conf`, con una unidad por línea. Solo agregá servicios que realmente estén instalados y cuya administración quieras delegar al controlador.
 
 ## Seguridad y limitaciones
 
-- Revisá el contenido del script antes de ejecutarlo como root.
-- Si el puerto 80 o 7300 está ocupado, no detengas procesos desconocidos
-  automáticamente. Identificá primero qué programa lo utiliza.
-- Un servicio `active` no garantiza accesibilidad desde Internet: verificá
-  escucha, firewall y reglas del proveedor.
-- El script presupone las unidades systemd `pdirect-c` y `udpgw-7300`.
-- Esta versión no modifica SSH, firewall, usuarios de Servex ni reglas de red.
+- No ejecutes scripts remotos como root sin revisar su contenido.
+- El instalador instala paquetes del sistema y crea una unidad systemd.
+- No abre puertos en el firewall del sistema ni en el panel del proveedor.
+- Un servicio activo no garantiza que sea accesible desde Internet; revisá escucha, firewall y reglas del proveedor.
+- Si el instalador se interrumpe a mitad del proceso, revisá los archivos y servicios antes de volver a ejecutarlo.
+- BadVPN upstream puede estar archivado o sin mantenimiento activo; evaluá ese riesgo antes de usarlo en producción.
