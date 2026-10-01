@@ -93,9 +93,10 @@ install -o root -g root -m 0755 \
 echo "[6/6] Configurando el servicio UDPGW..."
 
 if systemctl cat udpgw-7300.service >/dev/null 2>&1; then
-    echo "Ya existe udpgw-7300.service."
-    echo "No se sobrescribirá ni reiniciará."
-    echo "Revisá manualmente su configuración."
+    echo "ERROR: ya existe udpgw-7300.service."
+    echo "No se modificó el servicio existente."
+    echo "Por seguridad, la instalación se cancela."
+    exit 1
 else
     cat > /etc/systemd/system/udpgw-7300.service <<'EOF'
 [Unit]
