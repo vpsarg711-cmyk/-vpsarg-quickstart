@@ -1,104 +1,101 @@
-
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
 # VPS ARG QuickStart
-# Instalador de BadVPN UDPGW y controlador de servicios.
-# No modifica SSH ni instala componentes de fuentes no verificadas.
+# Instala BadVPN UDPGW y el controlador de servicios en Ubuntu.
+# No modifica SSH ni el firewall. No sobrescribe servicios/archivos existentes.
 
 RAW="https://raw.githubusercontent.com/vpsarg711-cmyk/-vpsarg-quickstart/main"
 BADVPN_REPO="https://github.com/ambrop72/badvpn.git"
-WORKDIR="$(mktemp -d)"
-trap 'rm -rf "$WORKDIR"' EXIT
+SERVICE="udpgw-7300.service"
+BINARY_PATH="/opt/badvpn/badvpn-udpgw"
+WORKDIR=""
+
+cleanup() {
+    if [[ -n "${WORKDIR:-}" && -d "$WORKDIR" ]]; then
+        rm -rf -- "$WORKDIR"
+    fi
+}
+trap cleanup EXIT
+
+fail() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
 
 if [[ ${EUID} -ne 0 ]]; then
-    echo "Ejecutá: sudo bash install.sh"
+    echo "Ejecutá: sudo bash install.sh" >&2
     exit 1
 fi
 
-if [[ ! -f /etc/os-release ]]; then
-    echo "No se pudo identificar el sistema operativo."
-    exit 1
-fi
-
+[[ -r /etc/os-release ]] || fail "No se pudo identificar el sistema operativo."
 . /etc/os-release
+[[ "${ID:-}" == "ubuntu" ]] || fail "Este instalador requiere Ubuntu."
 
-if [[ "$ID" != "ubuntu" ]]; then
-    echo "Este instalador requiere Ubuntu."
-    exit 1
+command -v apt-get >/dev/null 2>&1 || fail "No se encontró apt-get."
+command -v systemctl >/dev/null 2>&1 || fail "No se encontró systemctl."
+
+# Comprobaciones previas: cancelar antes de instalar paquetes o tocar archivos.
+if systemctl cat "$SERVICE" >/dev/null 2>&1; then
+    fail "Ya existe $SERVICE. No se modificó el sistema. Revisá el servicio existente."
 fi
-
-if ! command -v apt-get >/dev/null 2>&1; then
-    echo "No se encontró apt-get."
-    exit 1
+if [[ -e "$BINARY_PATH" ]]; then
+    fail "Ya existe $BINARY_PATH. No se sobrescribió."
 fi
-
-if ! command -v curl >/dev/null 2>&1; then
-    echo "Falta curl. El instalador necesita curl."
-    exit 1
+if [[ -e /etc/vpsarg-servicios.conf ]]; then
+    fail "Ya existe /etc/vpsarg-servicios.conf. No se sobrescribió."
+fi
+if [[ -e /usr/local/sbin/vpsarg-puertos ]]; then
+    fail "Ya existe /usr/local/sbin/vpsarg-puertos. No se sobrescribió."
 fi
 
 echo "======================================"
 echo "       VPS ARG QuickStart"
 echo "======================================"
-echo "Sistema: $PRETTY_NAME"
-echo
+echo "Sistema: ${PRETTY_NAME:-Ubuntu}"
 echo "Se instalará BadVPN UDPGW en TCP/7300."
-echo "No se modificará la configuración SSH."
+echo "No se modificará SSH ni el firewall."
+echo "Si ya existen componentes del mismo nombre, se cancelará."
 echo
 
 export DEBIAN_FRONTEND=noninteractive
+WORKDIR="$(mktemp -d)"
 
-echo "[1/6] Instalando dependencias..."
+echo "[1/7] Instalando dependencias..."
 apt-get update
 apt-get install -y --no-install-recommends \
     ca-certificates curl git cmake make gcc libc6-dev
 
-echo "[2/6] Descargando BadVPN..."
+echo "[2/7] Descargando el controlador desde GitHub..."
+curl -fsSL --retry 3 "$RAW/vpsarg-puertos.sh" -o "$WORKDIR/vpsarg-puertos.sh"
+bash -n "$WORKDIR/vpsarg-puertos.sh" || fail "El controlador descargado tiene errores de sintaxis."
+
+echo "[3/7] Descargando BadVPN..."
 git clone --depth 1 "$BADVPN_REPO" "$WORKDIR/badvpn"
 
-echo "[3/6] Compilando únicamente UDPGW..."
+echo "[4/7] Compilando únicamente UDPGW..."
 cmake -S "$WORKDIR/badvpn" -B "$WORKDIR/badvpn/build" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX=/usr/local \
     -DBUILD_NOTHING_BY_DEFAULT=1 \
     -DBUILD_UDPGW=1
-
 cmake --build "$WORKDIR/badvpn/build" --parallel 2
 
 BINARY="$WORKDIR/badvpn/build/udpgw/badvpn-udpgw"
+[[ -x "$BINARY" ]] || fail "No se encontró el binario compilado de UDPGW."
 
-if [[ ! -x "$BINARY" ]]; then
-    echo "ERROR: no se encontró el binario compilado de UDPGW."
-    exit 1
-fi
-
-echo "[4/6] Instalando el binario..."
+echo "[5/7] Instalando el binario y el controlador..."
 install -d -o root -g root -m 0755 /opt/badvpn
-install -o root -g root -m 0755 \
-    "$BINARY" /opt/badvpn/badvpn-udpgw
+install -o root -g root -m 0755 "$BINARY" "$BINARY_PATH"
+install -o root -g root -m 0755 "$WORKDIR/vpsarg-puertos.sh" /usr/local/sbin/vpsarg-puertos
 
-echo "[5/6] Instalando el controlador..."
-curl -fsSL --retry 3 "$RAW/vpsarg-puertos.sh" \
-    -o "$WORKDIR/vpsarg-puertos.sh"
+echo "[6/7] Creando la configuración del controlador..."
+printf '%s\n' 'udpgw-7300' > /etc/vpsarg-servicios.conf
+chown root:root /etc/vpsarg-servicios.conf
+chmod 0644 /etc/vpsarg-servicios.conf
 
-if ! bash -n "$WORKDIR/vpsarg-puertos.sh"; then
-    echo "ERROR: el controlador descargado tiene errores de sintaxis."
-    exit 1
-fi
-
-install -o root -g root -m 0755 \
-    "$WORKDIR/vpsarg-puertos.sh" /usr/local/sbin/vpsarg-puertos
-
-echo "[6/6] Configurando el servicio UDPGW..."
-
-if systemctl cat udpgw-7300.service >/dev/null 2>&1; then
-    echo "ERROR: ya existe udpgw-7300.service."
-    echo "No se modificó el servicio existente."
-    echo "Por seguridad, la instalación se cancela."
-    exit 1
-else
-    cat > /etc/systemd/system/udpgw-7300.service <<'EOF'
+echo "[7/7] Configurando y activando UDPGW..."
+cat > "/etc/systemd/system/$SERVICE" <<'EOF'
 [Unit]
 Description=VPS ARG - BadVPN UDPGW
 After=network.target
@@ -115,18 +112,19 @@ PrivateTmp=true
 [Install]
 WantedBy=multi-user.target
 EOF
-
-    systemctl daemon-reload
-    systemctl enable --now udpgw-7300.service
-fi
+chown root:root "/etc/systemd/system/$SERVICE"
+chmod 0644 "/etc/systemd/system/$SERVICE"
+systemctl daemon-reload
+systemctl enable --now "$SERVICE"
 
 echo
 echo "======================================"
-echo "Instalación base finalizada."
+echo "Instalación finalizada."
 echo "Controlador: /usr/local/sbin/vpsarg-puertos"
-echo "BadVPN UDPGW: puerto TCP 7300"
+echo "Servicio: $SERVICE"
+echo "Puerto: TCP/7300"
+echo "Comprobá el resultado con: sudo vpsarg-puertos estado"
 echo
-echo "PDirect-C aún no está automatizado."
-echo "HCR, VT Proxy y BHTTP quedan para una etapa posterior."
-echo "Revisá las reglas del firewall de tu proveedor."
+echo "PDirect-C, HCR, VT Proxy y BHTTP no se instalan en esta versión."
+echo "Revisá el firewall del proveedor si necesitás acceso desde Internet."
 echo "======================================"
