@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 
 CONFIG="/etc/vpsarg-servicios.conf"
-DEFAULT_SERVICES=(pdirect-c udpgw-7300)
+DEFAULT_SERVICES=(udpgw-7300)
 
 usage() {
   cat <<'EOF'
