@@ -3,16 +3,15 @@
 set -Eeuo pipefail
 
 # VPS ARG QuickStart
-# Instalador base para Ubuntu 22.04/24.04.
-# Instala BadVPN UDPGW y el controlador VPS ARG.
-# No modifica SSH ni reinicia servicios existentes.
+# Instalador de BadVPN UDPGW y controlador de servicios.
+# No modifica SSH ni instala componentes de fuentes no verificadas.
 
 RAW="https://raw.githubusercontent.com/vpsarg711-cmyk/-vpsarg-quickstart/main"
 BADVPN_REPO="https://github.com/ambrop72/badvpn.git"
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
 
-if [[ $EUID -ne 0 ]]; then
+if [[ ${EUID} -ne 0 ]]; then
     echo "Ejecutá: sudo bash install.sh"
     exit 1
 fi
@@ -34,6 +33,11 @@ if ! command -v apt-get >/dev/null 2>&1; then
     exit 1
 fi
 
+if ! command -v curl >/dev/null 2>&1; then
+    echo "Falta curl. El instalador necesita curl."
+    exit 1
+fi
+
 echo "======================================"
 echo "       VPS ARG QuickStart"
 echo "======================================"
@@ -45,21 +49,15 @@ echo
 
 export DEBIAN_FRONTEND=noninteractive
 
-echo "[1/5] Instalando dependencias..."
+echo "[1/6] Instalando dependencias..."
 apt-get update
 apt-get install -y --no-install-recommends \
-    ca-certificates \
-    curl \
-    git \
-    cmake \
-    make \
-    gcc \
-    libc6-dev
+    ca-certificates curl git cmake make gcc libc6-dev
 
-echo "[2/5] Descargando BadVPN..."
+echo "[2/6] Descargando BadVPN..."
 git clone --depth 1 "$BADVPN_REPO" "$WORKDIR/badvpn"
 
-echo "[3/5] Compilando únicamente UDPGW..."
+echo "[3/6] Compilando únicamente UDPGW..."
 cmake -S "$WORKDIR/badvpn" -B "$WORKDIR/badvpn/build" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX=/usr/local \
@@ -75,17 +73,29 @@ if [[ ! -x "$BINARY" ]]; then
     exit 1
 fi
 
-echo "[4/5] Instalando el binario..."
+echo "[4/6] Instalando el binario..."
 install -d -o root -g root -m 0755 /opt/badvpn
 install -o root -g root -m 0755 \
     "$BINARY" /opt/badvpn/badvpn-udpgw
 
-echo "[5/5] Configurando el servicio..."
+echo "[5/6] Instalando el controlador..."
+curl -fsSL --retry 3 "$RAW/vpsarg-puertos.sh" \
+    -o "$WORKDIR/vpsarg-puertos.sh"
+
+if ! bash -n "$WORKDIR/vpsarg-puertos.sh"; then
+    echo "ERROR: el controlador descargado tiene errores de sintaxis."
+    exit 1
+fi
+
+install -o root -g root -m 0755 \
+    "$WORKDIR/vpsarg-puertos.sh" /usr/local/sbin/vpsarg-puertos
+
+echo "[6/6] Configurando el servicio UDPGW..."
 
 if systemctl cat udpgw-7300.service >/dev/null 2>&1; then
     echo "Ya existe udpgw-7300.service."
-    echo "No se sobrescribirá ni reiniciará el servicio existente."
-    echo "Revisá su configuración antes de habilitar el servicio nuevo."
+    echo "No se sobrescribirá ni reiniciará."
+    echo "Revisá manualmente su configuración."
 else
     cat > /etc/systemd/system/udpgw-7300.service <<'EOF'
 [Unit]
@@ -110,9 +120,12 @@ EOF
 fi
 
 echo
-echo "BadVPN UDPGW: instalación completada."
-echo "Puerto configurado: TCP/7300"
+echo "======================================"
+echo "Instalación base finalizada."
+echo "Controlador: /usr/local/sbin/vpsarg-puertos"
+echo "BadVPN UDPGW: puerto TCP 7300"
 echo
-echo "El controlador VPS ARG se instalará por separado."
-echo "PDirect-C, HCR, VT Proxy y BHTTP quedan pendientes."
+echo "PDirect-C aún no está automatizado."
+echo "HCR, VT Proxy y BHTTP quedan para una etapa posterior."
 echo "Revisá las reglas del firewall de tu proveedor."
+echo "======================================"
