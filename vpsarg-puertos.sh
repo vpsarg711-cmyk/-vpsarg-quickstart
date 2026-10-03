@@ -5,6 +5,9 @@ set -Eeuo pipefail
 CONFIG="/etc/vpsarg-servicios.conf"
 PDIRECT_CONF="/etc/vpsarg-pdirect.conf"
 PDIRECT_SERVICE="pdirect-80"
+HCR_SERVICE="hcr-8880"
+HCR_CONF="/etc/vpsarg-hcr.conf"
+HCR_CTL="/usr/local/sbin/vpsarg-hcr"
 DEFAULT_SERVICES=(pdirect-80 udpgw-7300)
 
 usage() {
@@ -21,10 +24,12 @@ Uso:
   sudo vpsarg-puertos puerto-ssh           (muestra el puerto SSH de destino)
   sudo vpsarg-puertos puerto-ssh PUERTO    (cambia el puerto SSH de destino)
 
-Servicios: pdirect-80 (TCP 80) y udpgw-7300 (TCP 7300).
+Servicios: pdirect-80 (TCP 80), udpgw-7300 (TCP 7300) y, si está instalado,
+hcr-8880 (puerto en /etc/vpsarg-hcr.conf).
 Sin [servicio], la acción se aplica a todos los de /etc/vpsarg-servicios.conf.
 
-puerto-ssh solo cambia a qué puerto local 127.0.0.1 reenvía PDirect-C.
+puerto-ssh solo cambia a qué puerto local 127.0.0.1 reenvían PDirect-C y HCR
+(si está instalado). Debe ser el puerto donde ya escucha SSH.
 No modifica sshd, el puerto 80 ni el firewall.
 EOF
 }
@@ -113,49 +118,127 @@ show_status() {
     printf 'PDirect-C reenvía a 127.0.0.1:%s (SSH local): ' "$port"
     if port_open "$port"; then echo "responde"; else echo "NO responde"; fi
   fi
+  local ports=(80 7300) filter="" p
+  if [[ -r "$HCR_CONF" ]]; then
+    port="$(sed -n 's/^HCR_PORT=\([0-9]\{1,5\}\)$/\1/p' "$HCR_CONF" | tail -n 1)"
+    [[ -n "$port" ]] && ports+=("$port")
+  fi
+  for p in "${ports[@]}"; do
+    filter+="${filter:+ or }sport = :$p"
+  done
   echo
-  echo "===== Puertos TCP en escucha (80, 7300) ====="
+  echo "===== Puertos TCP en escucha (${ports[*]}) ====="
   if command -v ss >/dev/null 2>&1; then
-    ss -ltnp '( sport = :80 or sport = :7300 )'
+    ss -ltnp "( $filter )"
   else
     echo "No está disponible el comando ss (paquete iproute2)."
   fi
 }
 
+# Lee la primera línea de 127.0.0.1:PUERTO y comprueba que sea un banner SSH.
+ssh_banner() {
+  # shellcheck disable=SC2016  # el script interno se expande en el bash hijo
+  timeout 5 bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$1" || exit 1
+    IFS= read -r -t 4 l <&3 && [[ "$l" == SSH-* ]]' _ "$1" 2>/dev/null
+}
+
+# Pide una conexión a PDirect-C (TCP 80) y comprueba que detrás responda SSH.
+pdirect_reaches_ssh() {
+  # shellcheck disable=SC2016  # el script interno se expande en el bash hijo
+  timeout 6 bash -c 'exec 3<>/dev/tcp/127.0.0.1/80 || exit 1
+    printf "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n" >&3
+    for _ in 1 2 3 4 5 6 7 8; do
+      IFS= read -r -t 4 l <&3 || exit 1
+      [[ "$l" == SSH-* ]] && exit 0
+    done
+    exit 1' 2>/dev/null
+}
+
+# Puerto SSH que usa realmente el proceso de PDirect-C (su único argumento).
+pdirect_running_port() {
+  local pid
+  pid="$(systemctl show -p MainPID --value "$PDIRECT_SERVICE")"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  tr '\0' '\n' < "/proc/$pid/cmdline" | sed -n 2p
+}
+
+hcr_installed() {
+  [[ -x "$HCR_CTL" && -r "$HCR_CONF" ]] && systemctl cat "$HCR_SERVICE" >/dev/null 2>&1
+}
+
+hcr_ssh_port() {
+  sed -n 's/^HCR_SSH_PORT=\([0-9]\{1,5\}\)$/\1/p' "$HCR_CONF" | tail -n 1
+}
+
+write_pdirect_conf() {
+  local tmp
+  tmp="$(mktemp "${PDIRECT_CONF}.XXXXXX")"
+  printf 'SSH_PORT=%s\n' "$1" > "$tmp"
+  chmod 0644 "$tmp"
+  mv -f "$tmp" "$PDIRECT_CONF"
+}
+
+# Vuelve PDirect-C al puerto anterior después de un fallo.
+rollback_pdirect() {
+  local old="$1" was_active="$2"
+  write_pdirect_conf "$old"
+  if ((was_active)); then
+    systemctl restart "$PDIRECT_SERVICE" || true
+  fi
+}
+
+# Cambia el destino SSH de PDirect-C y, si está instalado, de HCR.
+# No cambia el puerto de sshd: el nuevo valor debe ser donde ya escucha SSH.
 set_ssh_port() {
-  local new="$1" old
+  local new="$1" old hcr_old="" ssh_ok=0 pd_active=0
   valid_port "$new" || fail "Puerto no válido: $new (usá un número entre 1 y 65535)."
   systemctl cat "$PDIRECT_SERVICE" >/dev/null 2>&1 || fail "No existe la unidad $PDIRECT_SERVICE."
   old="$(ssh_port_current)"
+  hcr_installed && hcr_old="$(hcr_ssh_port)"
 
-  if [[ "$new" == "$old" ]]; then
-    echo "PDirect-C ya reenvía a 127.0.0.1:$new. Sin cambios."
+  if [[ "$new" == "$old" && ( -z "$hcr_old" || "$hcr_old" == "$new" ) ]]; then
+    echo "PDirect-C${hcr_old:+ y HCR} ya reenvía${hcr_old:+n} a 127.0.0.1:$new. Sin cambios."
     return 0
   fi
 
-  if ! port_open "$new"; then
-    echo "AVISO: no hay ningún servicio escuchando en 127.0.0.1:$new." >&2
+  if ssh_banner "$new"; then
+    ssh_ok=1
+    echo "OK: SSH responde en 127.0.0.1:$new."
+  else
+    echo "AVISO: no hay un servidor SSH respondiendo en 127.0.0.1:$new." >&2
     echo "Comprobá el puerto real de SSH con: sudo ss -ltnp | grep -E 'sshd|systemd'" >&2
     confirm "¿Usar igualmente el puerto $new?" || fail "Cancelado. Se mantiene el puerto $old."
   fi
 
-  local tmp
-  tmp="$(mktemp "${PDIRECT_CONF}.XXXXXX")"
-  printf 'SSH_PORT=%s\n' "$new" > "$tmp"
-  chmod 0644 "$tmp"
-  mv -f "$tmp" "$PDIRECT_CONF"
-  echo "Puerto SSH de destino: $old -> $new (archivo $PDIRECT_CONF)."
-
-  if systemctl is-active --quiet "$PDIRECT_SERVICE"; then
-    if systemctl restart "$PDIRECT_SERVICE" && sleep 1 && systemctl is-active --quiet "$PDIRECT_SERVICE"; then
-      echo "$PDIRECT_SERVICE reiniciado. Sigue escuchando en TCP 80."
+  # 1) PDirect-C: solo cambia su archivo de configuración y se reinicia si estaba activo.
+  if [[ "$new" != "$old" ]]; then
+    write_pdirect_conf "$new"
+    echo "PDirect-C: destino $old -> $new (archivo $PDIRECT_CONF)."
+    if systemctl is-active --quiet "$PDIRECT_SERVICE"; then
+      pd_active=1
+      if ! { systemctl restart "$PDIRECT_SERVICE" && sleep 1 && systemctl is-active --quiet "$PDIRECT_SERVICE" \
+             && [[ "$(pdirect_running_port)" == "$new" ]]; } \
+         || { ((ssh_ok)) && ! pdirect_reaches_ssh; }; then
+        rollback_pdirect "$old" "$pd_active"
+        fail "$PDIRECT_SERVICE no funcionó con el puerto $new; se restauró $old. Revisá: journalctl -u $PDIRECT_SERVICE -n 50"
+      fi
+      echo "$PDIRECT_SERVICE reiniciado: escucha en TCP 80 y apunta a 127.0.0.1:$new."
     else
-      printf 'SSH_PORT=%s\n' "$old" > "$PDIRECT_CONF"
-      systemctl restart "$PDIRECT_SERVICE" || true
-      fail "$PDIRECT_SERVICE no arrancó con el puerto $new; se restauró $old. Revisá: journalctl -u $PDIRECT_SERVICE -n 50"
+      echo "$PDIRECT_SERVICE está detenido; el cambio se aplicará al iniciarlo."
     fi
-  else
-    echo "$PDIRECT_SERVICE está detenido; el cambio se aplicará al iniciarlo."
+  fi
+
+  # 2) HCR, si está instalado. vpsarg-hcr restaura su propio valor si falla.
+  if [[ -n "$hcr_old" && "$hcr_old" != "$new" ]]; then
+    if ! "$HCR_CTL" destino-ssh "$new"; then
+      [[ "$new" != "$old" ]] && rollback_pdirect "$old" "$pd_active"
+      fail "HCR no funcionó con el destino $new; se restauraron PDirect-C ($old) y HCR ($hcr_old)."
+    fi
+  fi
+
+  # 3) SSH sigue respondiendo en el puerto elegido.
+  if ((ssh_ok)) && ! ssh_banner "$new"; then
+    echo "AVISO: SSH dejó de responder en 127.0.0.1:$new durante el cambio. Revisá: systemctl status ssh" >&2
   fi
 }
 

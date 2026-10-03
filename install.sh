@@ -18,6 +18,8 @@ PDIRECT_UNIT="pdirect-80.service"
 UDPGW_BIN="/opt/badvpn/badvpn-udpgw"
 UDPGW_UNIT="udpgw-7300.service"
 CONTROLLER="/usr/local/sbin/vpsarg-puertos"
+HCR_CONTROLLER="/usr/local/sbin/vpsarg-hcr"
+HCR_CONF="/etc/vpsarg-hcr.conf"
 SERVICES_CONF="/etc/vpsarg-servicios.conf"
 VALIDATED_UBUNTU="20.04 22.04 24.04"
 
@@ -156,6 +158,8 @@ echo "[2/6] Obteniendo pdirect.c y el controlador..."
 fetch pdirect.c "$WORKDIR/pdirect.c"
 fetch vpsarg-puertos.sh "$WORKDIR/vpsarg-puertos.sh"
 bash -n "$WORKDIR/vpsarg-puertos.sh" || fail "El controlador descargado tiene errores de sintaxis."
+fetch vpsarg-hcr.sh "$WORKDIR/vpsarg-hcr.sh"
+bash -n "$WORKDIR/vpsarg-hcr.sh" || fail "El controlador de HCR descargado tiene errores de sintaxis."
 
 echo "[3/6] Compilando PDirect-C..."
 gcc -O2 -Wall -Wextra -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
@@ -181,9 +185,19 @@ install -d -o root -g root -m 0755 /opt/badvpn
 install -o root -g root -m 0755 "$WORKDIR/pdirect-c" "$PDIRECT_BIN"
 install -o root -g root -m 0755 "$WORKDIR/badvpn/build/udpgw/badvpn-udpgw" "$UDPGW_BIN"
 install -o root -g root -m 0755 "$WORKDIR/vpsarg-puertos.sh" "$CONTROLLER"
+# Solo se copia el controlador: HCR se instala aparte con "sudo vpsarg-hcr instalar".
+install -o root -g root -m 0755 "$WORKDIR/vpsarg-hcr.sh" "$HCR_CONTROLLER"
 
 printf 'SSH_PORT=%s\n' "$SSH_PORT" > "$PDIRECT_CONF"
-printf '%s\n' pdirect-80 udpgw-7300 > "$SERVICES_CONF"
+# Se conservan otros servicios ya registrados (por ejemplo hcr-8880).
+extra_services=()
+if [[ -r "$SERVICES_CONF" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[a-zA-Z0-9_.@-]+$ && "$line" != pdirect-80 && "$line" != udpgw-7300 ]] \
+            && extra_services+=("$line")
+    done < "$SERVICES_CONF"
+fi
+printf '%s\n' pdirect-80 udpgw-7300 "${extra_services[@]}" > "$SERVICES_CONF"
 chmod 0644 "$PDIRECT_CONF" "$SERVICES_CONF"
 
 cat > "/etc/systemd/system/$PDIRECT_UNIT" <<EOF
@@ -257,4 +271,12 @@ echo "Controlador: sudo vpsarg-puertos estado"
 echo "Cambiar puerto SSH de destino: sudo vpsarg-puertos puerto-ssh PUERTO"
 echo
 echo "El firewall no se modificó: abrí TCP 80 y 7300 en el proveedor si hace falta."
+if [[ -r "$HCR_CONF" ]]; then
+    hcr_ssh="$(sed -n 's/^HCR_SSH_PORT=\([0-9]\{1,5\}\)$/\1/p' "$HCR_CONF" | tail -n 1)"
+    if [[ -n "$hcr_ssh" && "$hcr_ssh" != "$SSH_PORT" ]]; then
+        echo "AVISO: HCR apunta a 127.0.0.1:$hcr_ssh y PDirect-C a 127.0.0.1:$SSH_PORT."
+        echo "Para unificarlos: sudo vpsarg-puertos puerto-ssh $SSH_PORT"
+    fi
+fi
+echo "HCR (opcional): copiá hcr-server a /opt/hcr/ y ejecutá: sudo vpsarg-hcr instalar"
 echo "======================================"

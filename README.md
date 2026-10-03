@@ -6,8 +6,9 @@ Instalador para Ubuntu que compila e instala dos servicios ligeros, cada uno con
 |---|---|---|---|
 | PDirect-C | `pdirect-80.service` | `0.0.0.0:80/TCP` | SSH local `127.0.0.1:PUERTO_SSH` (22 por defecto) |
 | BadVPN UDPGW | `udpgw-7300.service` | `0.0.0.0:7300/TCP` | — |
+| HCR (opcional, se instala aparte) | `hcr-8880.service` | `:8880/TCP` (configurable) | SSH local `127.0.0.1:PUERTO_SSH` |
 
-Incluye el controlador `vpsarg-puertos` para consultar estado, iniciar, detener, reiniciar, habilitar, deshabilitar y cambiar el puerto SSH de destino.
+Incluye el controlador `vpsarg-puertos` para consultar estado, iniciar, detener, reiniciar, habilitar, deshabilitar y cambiar el puerto SSH de destino, y `vpsarg-hcr` para instalar y administrar HCR (ver [HCR](#hcr-opcional)).
 
 No instala panel web ni base de datos. **No modifica `sshd_config`, no reinicia SSH y no toca el firewall.**
 
@@ -40,7 +41,7 @@ El instalador:
 2. Si detecta una instalación previa, la lista y solo continúa si escribís `SI`.
 3. Pregunta el puerto SSH local (Enter = 22, o el valor de una instalación previa) y comprueba que haya algo escuchando en `127.0.0.1:PUERTO`. Si no lo hay, avisa y pide confirmación.
 4. Instala dependencias: `ca-certificates curl git cmake make gcc libc6-dev libevent-dev`.
-5. Descarga `pdirect.c` y `vpsarg-puertos.sh` de la rama `main` y compila PDirect-C:
+5. Descarga `pdirect.c`, `vpsarg-puertos.sh` y `vpsarg-hcr.sh` de la rama `main` y compila PDirect-C:
    `gcc -O2 -Wall -Wextra -D_FORTIFY_SOURCE=2 -fstack-protector-strong -o pdirect-c pdirect.c -levent_core`
 6. Clona BadVPN (`github.com/ambrop72/badvpn`) y compila solo UDPGW con CMake.
 7. Instala los archivos, crea las unidades systemd, las habilita y comprueba que ambos servicios estén activos y escuchando.
@@ -54,6 +55,7 @@ Si cualquier paso crítico falla, se detiene con un mensaje de error. Hasta el p
 | `/usr/local/bin/pdirect-c` | PDirect-C compilado |
 | `/opt/badvpn/badvpn-udpgw` | BadVPN UDPGW compilado |
 | `/usr/local/sbin/vpsarg-puertos` | Controlador |
+| `/usr/local/sbin/vpsarg-hcr` | Controlador de HCR (no instala HCR por sí solo) |
 | `/etc/vpsarg-pdirect.conf` | `SSH_PORT=22` — única fuente del puerto SSH de destino |
 | `/etc/vpsarg-servicios.conf` | Servicios que maneja el controlador |
 | `/etc/systemd/system/pdirect-80.service` | Unidad de PDirect-C |
@@ -76,7 +78,7 @@ sudo vpsarg-puertos detener udpgw-7300
 
 ## Puerto SSH de destino
 
-PDirect-C siempre escucha en TCP 80 y reenvía a `127.0.0.1:PUERTO_SSH`. Para ver o cambiar ese puerto:
+PDirect-C siempre escucha en TCP 80 y reenvía a `127.0.0.1:PUERTO_SSH`. HCR, si está instalado, reenvía al mismo puerto. Para ver o cambiar ese puerto:
 
 ```bash
 sudo vpsarg-puertos puerto-ssh          # muestra el puerto actual
@@ -85,14 +87,59 @@ sudo vpsarg-puertos puerto-ssh 2222     # cambia el destino a 127.0.0.1:2222
 
 El cambio:
 
-- Valida el número (1-65535) y comprueba que haya algo escuchando en `127.0.0.1:PUERTO`; si no, avisa y pide confirmación.
-- Escribe `SSH_PORT=PUERTO` en `/etc/vpsarg-pdirect.conf` y reinicia solo `pdirect-80`.
-- Si `pdirect-80` no arranca con el nuevo valor, restaura el anterior.
+- Valida el número (1-65535) y comprueba que en `127.0.0.1:PUERTO` responda un servidor SSH; si no, avisa y pide confirmación.
+- Escribe `SSH_PORT=PUERTO` en `/etc/vpsarg-pdirect.conf`, reinicia solo `pdirect-80` y comprueba que el proceso use el puerto nuevo y que una conexión por TCP 80 llegue a SSH.
+- Si HCR está instalado, actualiza `HCR_SSH_PORT` en `/etc/vpsarg-hcr.conf` y reinicia solo `hcr-8880`.
+- Si algo falla, restaura el valor anterior en PDirect-C y en HCR.
 - No modifica sshd, el puerto 80, UDPGW ni el firewall.
 
 **Importante:** este comando no cambia el puerto en el que escucha SSH. Si cambiás el puerto de sshd por tu cuenta, después ejecutá `puerto-ssh` con el puerto nuevo.
 
 PDirect-C acepta la cabecera `X-Real-Host` solo si vale `127.0.0.1:PUERTO_SSH` o `localhost:PUERTO_SSH` (con el puerto configurado); si la cabecera no está, permite la conexión. Si tu payload incluye `X-Real-Host`, tiene que usar el mismo puerto.
+
+## HCR (opcional)
+
+HCR se instala aparte, como servicio independiente `hcr-8880.service`, a partir del binario `hcr-server` entregado por el proveedor (Go, x86_64, sin código fuente). El binario **no** está en este repositorio.
+
+```bash
+sudo mkdir -p /opt/hcr
+# Copiá hcr-server por SFTP a /opt/hcr/ y después:
+sudo chown root:root /opt/hcr/hcr-server && sudo chmod 755 /opt/hcr/hcr-server
+sudo vpsarg-hcr instalar          # puerto 8880, transporte plain, destino = puerto SSH de PDirect-C
+sudo vpsarg-hcr estado
+sudo vpsarg-hcr iniciar | detener | reiniciar
+sudo vpsarg-hcr puerto 8080       # cambiar el puerto (1024-65535, libre); sin número lo muestra
+sudo vpsarg-hcr desinstalar
+```
+
+`instalar` comprueba x86_64, el sha256 del binario entregado (`68a66ed4…fa085`; otra versión requiere `--sha256 HASH`), que responda a `-version`, el espacio libre y que el puerto esté libre. **No detiene ningún programa** para liberar un puerto. Repetirlo no duplica nada y conserva `/etc/vpsarg-hcr.conf`. No usa ni modifica el `install.sh` del proveedor ni su `hcr-server.service`.
+
+El servicio corre con un usuario temporal sin privilegios (`DynamicUser=yes`), sin capacidades y con el sistema de archivos en solo lectura (`ProtectSystem=strict`). Sus registros van al journal con el nombre `hcr-8880`: `journalctl -u hcr-8880`.
+
+| Archivo | Contenido |
+|---|---|
+| `/opt/hcr/hcr-server` | Original copiado por SFTP (no se modifica ni se borra) |
+| `/usr/local/lib/vpsarg/hcr-server` | Copia que ejecuta el servicio |
+| `/etc/vpsarg-hcr.conf` | Puerto, destino SSH, transporte y límites |
+| `/etc/systemd/system/hcr-8880.service` | Unidad |
+
+El nombre `hcr-8880` es fijo aunque cambies el puerto; `vpsarg-hcr estado` muestra el puerto real.
+
+### Límites de HCR
+
+Valores iniciales en `/etc/vpsarg-hcr.conf`. No se aumentan hasta probar un cliente HCR compatible.
+
+| Variable | Opción del binario | Valor | Qué limita |
+|---|---|---|---|
+| `HCR_MAX_SESSIONS` | `-max-sessions` | 32 | Sesiones HCR simultáneas en todo el servidor |
+| `HCR_MAX_SESSIONS_PER_IP` | `-max-sessions-per-ip` | 16 | Sesiones HCR simultáneas desde una misma IP |
+| `HCR_MAX_CONNECTIONS` | `-max-connections` | 2048 | Conexiones TCP simultáneas al puerto, incluidas las que todavía no se identificaron. **No son usuarios ni sesiones**: una sesión HCR puede usar varias conexiones. Al superarlo, la conexión nueva se cierra al instante (`connection_rejected`, `global_connection_limit` en el journal) |
+| `HCR_MAX_DOWNLOAD_FRAME` | `-max-download-frame` | 6144 | Bytes por trama de bajada |
+| `HCR_DOWNLOAD_POLL_TIMEOUT` | `-download-poll-timeout` | 8s | Espera máxima de una conexión de bajada |
+
+**CGNAT:** las operadoras móviles hacen salir a muchos clientes por la misma IP pública. Con 16 sesiones por IP, el cliente número 17 detrás de esa IP queda rechazado aunque haya cupos globales libres.
+
+**Sin probar todavía:** no se dispone de un cliente HCR, así que no está verificado que un cliente real se conecte de punta a punta. HCR usa su propio protocolo: no acepta payloads HTTP como PDirect-C. La autenticación de los usuarios sigue siendo la de SSH (usuario y contraseña de la cuenta).
 
 ## Diagnóstico
 
@@ -125,14 +172,16 @@ printf 'GET / HTTP/1.1\r\nHost: x\r\n\r\n' | timeout 3 nc 127.0.0.1 80
 
 ## Desinstalación
 
-No toca SSH ni el firewall:
+Si instalaste HCR, quitalo primero (no toca PDirect-C ni UDPGW y conserva `/opt/hcr`): `sudo vpsarg-hcr desinstalar`.
+
+El resto no toca SSH ni el firewall:
 
 ```bash
 sudo systemctl disable --now pdirect-80 udpgw-7300
 sudo rm -f /etc/systemd/system/pdirect-80.service /etc/systemd/system/udpgw-7300.service
 sudo systemctl daemon-reload
 sudo rm -f /usr/local/bin/pdirect-c /opt/badvpn/badvpn-udpgw /usr/local/sbin/vpsarg-puertos \
-           /etc/vpsarg-pdirect.conf /etc/vpsarg-servicios.conf
+           /usr/local/sbin/vpsarg-hcr /etc/vpsarg-pdirect.conf /etc/vpsarg-servicios.conf
 sudo rmdir /opt/badvpn
 ```
 
