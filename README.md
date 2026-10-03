@@ -14,6 +14,7 @@ No instala panel web ni base de datos. **No modifica `sshd_config`, no reinicia 
 
 ## Requisitos
 
+- Un **token de instalación** válido (ver [Token de instalación](#token-de-instalación)).
 - Ubuntu 20.04, 22.04 o 24.04 con systemd (en otra versión el instalador avisa y pide confirmación).
 - Acceso root (`sudo`) y conexión a Internet.
 - Puertos TCP 80 y 7300 libres. Si otro programa los usa (por ejemplo nginx o apache en el 80), el instalador se detiene sin hacer cambios.
@@ -37,14 +38,15 @@ sudo bash /tmp/vpsarg-install.sh
 
 El instalador:
 
-1. Comprueba root, Ubuntu, systemd y que TCP 80 y 7300 estén libres.
+1. Comprueba root, Ubuntu y systemd, y pide el token de instalación (o lo toma de `VPSARG_TOKEN`). Si falta o no es válido, se detiene **sin cambiar nada**. Después comprueba que TCP 80 y 7300 estén libres.
 2. Si detecta una instalación previa, la lista y solo continúa si escribís `SI`.
 3. Pregunta el puerto SSH local (Enter = 22, o el valor de una instalación previa) y comprueba que haya algo escuchando en `127.0.0.1:PUERTO`. Si no lo hay, avisa y pide confirmación.
 4. Instala dependencias: `ca-certificates curl git cmake make gcc libc6-dev libevent-dev`.
-5. Descarga `pdirect.c`, `vpsarg-puertos.sh`, `vpsarg-hcr.sh`, `vpsarg-panel.sh` y `vpsarg-usuarios.sh` de la rama `main` y compila PDirect-C:
+5. Descarga `pdirect.c`, `vpsarg-puertos.sh`, `vpsarg-hcr.sh`, `vpsarg-panel.sh` y `vpsarg-usuarios.sh` de la rama `main` (el verificador `vpsarg-token.sh` ya se descargó en el paso 1) y compila PDirect-C:
    `gcc -O2 -Wall -Wextra -D_FORTIFY_SOURCE=2 -fstack-protector-strong -o pdirect-c pdirect.c -levent_core`
 6. Clona BadVPN (`github.com/ambrop72/badvpn`) y compila solo UDPGW con CMake.
 7. Instala los archivos, crea las unidades systemd, las habilita y comprueba que ambos servicios estén activos y escuchando.
+8. Si el token incluye HCR, instala HCR (ver [HCR](#hcr-opcional)). Registra el id del token como usado.
 
 Si cualquier paso crítico falla, se detiene con un mensaje de error. Hasta el paso 7 no se instala ni se reemplaza ningún archivo del sistema (salvo los paquetes de apt).
 
@@ -58,12 +60,28 @@ Si cualquier paso crítico falla, se detiene con un mensaje de error. Hasta el p
 | `/usr/local/sbin/vpsarg-hcr` | Controlador de HCR (no instala HCR por sí solo) |
 | `/usr/local/sbin/vpsarg` | Panel de administración |
 | `/usr/local/sbin/vpsarg-usuarios` | Cuentas SSH de los usuarios |
+| `/usr/local/lib/vpsarg/token.sh` | Verificador del token (lo usa `vpsarg-hcr instalar`) |
+| `/etc/vpsarg/tokens-usados` | Ids de los tokens usados en esta VPS (nunca el token) |
 | `/etc/vpsarg-pdirect.conf` | `SSH_PORT=22` — única fuente del puerto SSH de destino |
 | `/etc/vpsarg-servicios.conf` | Servicios que maneja el controlador |
 | `/etc/systemd/system/pdirect-80.service` | Unidad de PDirect-C |
 | `/etc/systemd/system/udpgw-7300.service` | Unidad de UDPGW |
 
 Ambos servicios corren con un usuario temporal sin privilegios (`DynamicUser=yes`). PDirect-C solo recibe la capacidad `CAP_NET_BIND_SERVICE` para abrir el puerto 80.
+
+## Token de instalación
+
+El token **solo autoriza instalar**. No interviene en el login de los usuarios (siguen entrando con usuario y contraseña SSH) ni en PDirect-C, UDPGW o HCR una vez instalados: si vence, la VPS sigue funcionando igual.
+
+- Formato: `vpsarg1.DATOS.FIRMA`. Los datos son `id`, `vence` (AAAA-MM-DD, vale hasta ese día inclusive, UTC), `alcance` (`base` o `base,hcr`) y una `nota` opcional, firmados con ECDSA P-256 por quien emite los tokens.
+- Se escribe cuando el instalador lo pide (sin eco) o con `VPSARG_TOKEN`. Nunca como argumento.
+- `install.sh` lo verifica **antes de cualquier cambio**: firma, datos, vencimiento, alcance y que no se haya usado en esta VPS. Sin `openssl` también se detiene sin cambios.
+- Con alcance `base,hcr`, el instalador exige `/opt/hcr/hcr-server` y comprueba HCR (`vpsarg-hcr verificar`) antes de cambiar nada, y lo instala en la misma corrida.
+- Un token usado queda en `/etc/vpsarg/tokens-usados` y no sirve otra vez en esta VPS. Instalar HCR después exige un token **nuevo** con alcance `base,hcr`.
+
+**Limitaciones:** el repositorio es público, así que el control se puede quitar copiando el código. El registro de tokens usados es local: el mismo token sirve en otra VPS hasta que vence (conviene emitirlos con vencimientos cortos), y root puede borrar el registro.
+
+**Emisión** (en tu computadora, nunca en una VPS): `herramientas/emitir-token.sh clave CARPETA` crea la clave privada y muestra la pública, que va en `VPSARG_TOKEN_PUBKEY` de `vpsarg-token.sh`. Después: `herramientas/emitir-token.sh emitir CLAVE_PRIVADA ID VENCE ALCANCE [NOTA]`. La clave privada no se sube al repositorio ni se copia a ninguna VPS.
 
 ## Administración
 
@@ -154,14 +172,15 @@ HCR se instala aparte, como servicio independiente `hcr-8880.service`, a partir 
 sudo mkdir -p /opt/hcr
 # Copiá hcr-server por SFTP a /opt/hcr/ y después:
 sudo chown root:root /opt/hcr/hcr-server && sudo chmod 755 /opt/hcr/hcr-server
-sudo vpsarg-hcr instalar          # puerto 8880, transporte plain, destino = puerto SSH de PDirect-C
+sudo vpsarg-hcr verificar         # comprueba sin cambiar nada (no pide token)
+sudo vpsarg-hcr instalar          # pide un token nuevo con alcance base,hcr; puerto 8880, transporte plain, destino = puerto SSH de PDirect-C
 sudo vpsarg-hcr estado
 sudo vpsarg-hcr iniciar | detener | reiniciar
 sudo vpsarg-hcr puerto 8080       # cambiar el puerto (1024-65535, libre); sin número lo muestra
 sudo vpsarg-hcr desinstalar
 ```
 
-`instalar` comprueba x86_64, el sha256 del binario entregado (`68a66ed4…fa085`; otra versión requiere `--sha256 HASH`), que responda a `-version`, el espacio libre y que el puerto esté libre. **No detiene ningún programa** para liberar un puerto. Repetirlo no duplica nada y conserva `/etc/vpsarg-hcr.conf`. No usa ni modifica el `install.sh` del proveedor ni su `hcr-server.service`.
+`instalar` exige un token válido con HCR y no usado en esta VPS, y comprueba x86_64, el sha256 del binario entregado (`68a66ed4…fa085`; otra versión requiere `--sha256 HASH`), que responda a `-version`, el espacio libre y que el puerto esté libre. **No detiene ningún programa** para liberar un puerto. Repetirlo (con otro token) no duplica nada y conserva `/etc/vpsarg-hcr.conf`. `estado`, `puerto`, `destino-ssh`, `iniciar`, `detener`, `reiniciar` y `desinstalar` no piden token. No usa ni modifica el `install.sh` del proveedor ni su `hcr-server.service`.
 
 El servicio corre con un usuario temporal sin privilegios (`DynamicUser=yes`), sin capacidades y con el sistema de archivos en solo lectura (`ProtectSystem=strict`). Sus registros van al journal con el nombre `hcr-8880`: `journalctl -u hcr-8880`.
 
@@ -232,8 +251,9 @@ sudo systemctl disable --now pdirect-80 udpgw-7300
 sudo rm -f /etc/systemd/system/pdirect-80.service /etc/systemd/system/udpgw-7300.service
 sudo systemctl daemon-reload
 sudo rm -f /usr/local/bin/pdirect-c /opt/badvpn/badvpn-udpgw /usr/local/sbin/vpsarg-puertos \
-           /usr/local/sbin/vpsarg-hcr /usr/local/sbin/vpsarg /usr/local/sbin/vpsarg-usuarios /etc/vpsarg-pdirect.conf /etc/vpsarg-servicios.conf
-sudo rmdir /opt/badvpn
+           /usr/local/sbin/vpsarg-hcr /usr/local/sbin/vpsarg /usr/local/sbin/vpsarg-usuarios /etc/vpsarg-pdirect.conf /etc/vpsarg-servicios.conf \
+           /usr/local/lib/vpsarg/token.sh
+sudo rmdir /opt/badvpn /usr/local/lib/vpsarg
 ```
 
 Los paquetes de compilación quedan instalados. Si los quitás, no elimines las bibliotecas `libevent` mientras uses PDirect-C.

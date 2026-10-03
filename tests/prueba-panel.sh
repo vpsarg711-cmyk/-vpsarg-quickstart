@@ -22,6 +22,9 @@ hcr_arg() { tr '\0' '\n' < "/proc/$(pid_of hcr-8880)/cmdline" | grep -A1 -x -- "
 pd_port() { tr '\0' '\n' < "/proc/$(pid_of pdirect-80)/cmdline" | sed -n 2p; }
 # Maneja el menú: panel "respuestas separadas por \n". Termina cuando se acaba la entrada.
 panel() { printf "%b" "$1" | timeout 60 vpsarg > "$OUT" 2>&1; }
+# Tokens de laboratorio (instalar HCR exige uno nuevo con HCR): el arnés del contenedor
+# indica el emisor y la clave de prueba en VPSARG_LAB_EMISOR y VPSARG_LAB_CLAVE.
+lab_token() { bash "${VPSARG_LAB_EMISOR:?}" emitir "${VPSARG_LAB_CLAVE:?}" "$1-$$" "$(date -u +%F)" base,hcr; }
 has() { grep -q -- "$1" "$OUT"; }
 state_line() { vpsarg estado | grep -- "$1" | awk '{print $2, $3}'; }
 journal_has() { journalctl -t vpsarg-panel -o cat | grep -q -- "$1"; }
@@ -80,7 +83,7 @@ echo "### HCR desde el panel"
 panel "4\n1\nn\n\n0\n0\n"
 check "responder n no instala" bash -c '! systemctl cat hcr-8880 >/dev/null 2>&1'
 check "el menú HCR avisa que no está validado para producción" has "no está validado para producción"
-panel "4\n1\ns\n\n0\n0\n"
+VPSARG_TOKEN="$(lab_token prueba-panel-1)" panel "4\n1\ns\n\n0\n0\n"
 check "instalar HCR" systemctl is-active --quiet hcr-8880
 check "HCR ACTIVO en 8880" test "$(state_line '^HCR')" = "ACTIVO 8880"
 check "registro: instalar ok" journal_has "accion=instalar servicio=hcr-8880 resultado=ok"

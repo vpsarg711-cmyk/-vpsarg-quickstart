@@ -29,6 +29,9 @@ pdirect_ssh() {
     for _ in 1 2 3 4 5 6 7 8; do IFS= read -r -t 4 l <&3 || exit 1; [[ "$l" == SSH-* ]] && exit 0; done; exit 1' 2>/dev/null
 }
 conf() { sed -n "s/^$1=//p" /etc/vpsarg-hcr.conf; }
+# Tokens de laboratorio (instalar HCR exige uno nuevo con HCR): el arnés del contenedor
+# indica el emisor y la clave de prueba en VPSARG_LAB_EMISOR y VPSARG_LAB_CLAVE.
+lab_token() { bash "${VPSARG_LAB_EMISOR:?}" emitir "${VPSARG_LAB_CLAVE:?}" "$1-$$" "$(date -u +%F)" base,hcr; }
 
 echo "### Preparación"
 install -d -m 0755 /opt/hcr
@@ -41,9 +44,9 @@ PD_PID0="$(systemctl show -p MainPID --value pdirect-80)"
 UG_PID0="$(systemctl show -p MainPID --value udpgw-7300)"
 
 echo "### Instalación"
-check "rechaza un binario con sha256 distinto" \
+VPSARG_TOKEN="$(lab_token prueba-hcr-sha)" check "rechaza un binario con sha256 distinto" \
   bash -c 'cp /opt/hcr/hcr-server /tmp/hcr-mod && printf x >> /tmp/hcr-mod && ! vpsarg-hcr instalar --binario /tmp/hcr-mod >/dev/null 2>&1 && ! test -e /etc/systemd/system/hcr-8880.service'
-check "instalar" vpsarg-hcr instalar
+check "instalar" env VPSARG_TOKEN="$(lab_token prueba-hcr-1)" vpsarg-hcr instalar
 check "hcr-8880 activo" systemctl is-active --quiet hcr-8880
 check "habilitado al arranque" systemctl is-enabled --quiet hcr-8880
 check "escucha en TCP 8880" listening 8880
@@ -55,7 +58,7 @@ check "-max-sessions 32" test "$(hcr_arg -max-sessions)" = 32
 check "-max-sessions-per-ip 16" test "$(hcr_arg -max-sessions-per-ip)" = 16
 check "el journal confirma 32/16" \
   bash -c 'journalctl -u hcr-8880 -o cat | grep runtime_configured | tail -n 1 | grep -q "\"max_sessions\":32,\"max_sessions_per_source\":16"'
-check "segunda instalación (sin duplicar)" vpsarg-hcr instalar
+check "segunda instalación (sin duplicar, token nuevo)" env VPSARG_TOKEN="$(lab_token prueba-hcr-2)" vpsarg-hcr instalar
 check "una sola unidad hcr-8880" test "$(systemctl list-unit-files --no-legend 'hcr-8880*' | wc -l)" = 1
 check "una sola línea en vpsarg-servicios.conf" test "$(grep -cx hcr-8880 /etc/vpsarg-servicios.conf)" = 1
 

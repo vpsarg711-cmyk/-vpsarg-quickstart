@@ -21,6 +21,8 @@ CONTROLLER="/usr/local/sbin/vpsarg-puertos"
 HCR_CONTROLLER="/usr/local/sbin/vpsarg-hcr"
 PANEL="/usr/local/sbin/vpsarg"
 USERS_CONTROLLER="/usr/local/sbin/vpsarg-usuarios"
+TOKEN_LIB="/usr/local/lib/vpsarg/token.sh"
+HCR_SOURCE="/opt/hcr/hcr-server"
 HCR_CONF="/etc/vpsarg-hcr.conf"
 SERVICES_CONF="/etc/vpsarg-servicios.conf"
 VALIDATED_UBUNTU="20.04 22.04 24.04"
@@ -85,6 +87,24 @@ for cmd in apt-get systemctl ss timeout; do
 done
 [[ -d /run/systemd/system ]] || fail "systemd no es el sistema de inicio activo."
 
+# ---------------------------------------------------------------- token de instalación
+# Se verifica antes de cualquier cambio. Solo autoriza instalar: no interviene en el
+# login de los usuarios ni en los servicios instalados.
+WORKDIR="$(mktemp -d)"
+fetch vpsarg-token.sh "$WORKDIR/vpsarg-token.sh" \
+    || fail "No se pudo obtener el verificador de tokens. No se realizaron cambios."
+bash -n "$WORKDIR/vpsarg-token.sh" || fail "El verificador de tokens tiene errores de sintaxis. No se realizaron cambios."
+# shellcheck source=vpsarg-token.sh
+. "$WORKDIR/vpsarg-token.sh"
+token_read
+unset VPSARG_TOKEN
+token_verify base
+INSTALL_HCR=0
+if [[ "$TOKEN_SCOPE" == base,hcr ]]; then
+    INSTALL_HCR=1
+    [[ -f "$HCR_SOURCE" ]] || fail "El token incluye HCR pero falta $HCR_SOURCE (copialo primero) o usá un token solo base. No se realizaron cambios."
+fi
+
 echo "======================================"
 echo "       VPS ARG QuickStart"
 echo "======================================"
@@ -147,9 +167,16 @@ else
     [[ "$REPLY" =~ ^[sS]$ ]] || fail "Cancelado. No se realizaron cambios."
 fi
 
+# HCR (si el token lo incluye): las mismas comprobaciones de "vpsarg-hcr instalar", sin cambios.
+if ((INSTALL_HCR)); then
+    fetch vpsarg-hcr.sh "$WORKDIR/vpsarg-hcr.sh" || fail "No se pudo obtener el controlador de HCR. No se realizaron cambios."
+    bash -n "$WORKDIR/vpsarg-hcr.sh" || fail "El controlador de HCR descargado tiene errores de sintaxis. No se realizaron cambios."
+    bash "$WORKDIR/vpsarg-hcr.sh" verificar --ssh-puerto "$SSH_PORT" \
+        || fail "HCR no se puede instalar en esta VPS (ver arriba). No se realizaron cambios."
+fi
+
 # ---------------------------------------------------------------- compilación
 export DEBIAN_FRONTEND=noninteractive
-WORKDIR="$(mktemp -d)"
 
 echo "[1/6] Instalando dependencias..."
 apt-get update
@@ -195,6 +222,8 @@ install -o root -g root -m 0755 "$WORKDIR/vpsarg-puertos.sh" "$CONTROLLER"
 install -o root -g root -m 0755 "$WORKDIR/vpsarg-hcr.sh" "$HCR_CONTROLLER"
 install -o root -g root -m 0755 "$WORKDIR/vpsarg-panel.sh" "$PANEL"
 install -o root -g root -m 0755 "$WORKDIR/vpsarg-usuarios.sh" "$USERS_CONTROLLER"
+install -d -o root -g root -m 0755 "${TOKEN_LIB%/*}"
+install -o root -g root -m 0644 "$WORKDIR/vpsarg-token.sh" "$TOKEN_LIB"
 
 printf 'SSH_PORT=%s\n' "$SSH_PORT" > "$PDIRECT_CONF"
 # Se conservan otros servicios ya registrados (por ejemplo hcr-8880).
@@ -270,6 +299,17 @@ for pair in "80:$PDIRECT_UNIT" "7300:$UDPGW_UNIT"; do
 done
 ((ok)) || fail "La instalación terminó con servicios fallidos."
 
+if ((INSTALL_HCR)); then
+    echo "[HCR] Instalando HCR (incluido en el token)..."
+    if ! VPSARG_TOKEN="$TOKEN" "$HCR_CONTROLLER" instalar; then
+        TOKEN=""
+        token_mark_used base
+        fail "La base quedó instalada, pero HCR no (ver arriba). El token ya se usó: para HCR hace falta un token nuevo."
+    fi
+fi
+TOKEN=""
+token_mark_used base
+
 echo
 echo "======================================"
 echo "Instalación finalizada."
@@ -287,5 +327,9 @@ if [[ -r "$HCR_CONF" ]]; then
         echo "Para unificarlos: sudo vpsarg-puertos puerto-ssh $SSH_PORT"
     fi
 fi
-echo "HCR (opcional): copiá hcr-server a /opt/hcr/ y ejecutá: sudo vpsarg-hcr instalar"
+if ((INSTALL_HCR)); then
+    echo "HCR:         instalado (no validado para producción): sudo vpsarg-hcr estado"
+else
+    echo "HCR (opcional): copiá hcr-server a /opt/hcr/ y ejecutá: sudo vpsarg-hcr instalar (pide un token nuevo con HCR)"
+fi
 echo "======================================"

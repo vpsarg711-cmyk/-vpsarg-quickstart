@@ -17,6 +17,7 @@ PDIRECT_CONF="/etc/vpsarg-pdirect.conf"
 SERVICES_CONF="/etc/vpsarg-servicios.conf"
 BACKUP_ROOT="/var/backups/vpsarg"
 VENDOR_UNIT="hcr-server.service"
+TOKEN_LIB="/usr/local/lib/vpsarg/token.sh"
 RESERVED_PORTS=(80 7300)
 
 # Valores iniciales. Los límites no se aumentan hasta probar un cliente compatible.
@@ -37,6 +38,7 @@ VPS ARG QuickStart - HCR (servicio hcr-8880)
 
 Uso:
   sudo vpsarg-hcr instalar [--binario RUTA] [--puerto N] [--ssh-puerto N] [--sha256 HASH]
+  sudo vpsarg-hcr verificar [mismas opciones]   (comprueba sin instalar ni cambiar nada)
   sudo vpsarg-hcr estado
   sudo vpsarg-hcr iniciar | detener | reiniciar
   sudo vpsarg-hcr puerto              (muestra el puerto de escucha)
@@ -47,6 +49,7 @@ Uso:
 
 instalar copia el binario (por defecto /opt/hcr/hcr-server, verificado por sha256)
 a /usr/local/lib/vpsarg/ y crea hcr-8880.service con un usuario sin privilegios.
+instalar pide un token de instalación válido que incluya HCR y no se haya usado en esta VPS.
 Puerto inicial: 8880, transporte plain, 32 sesiones globales y 16 por IP.
 destino-ssh no cambia el puerto de sshd: indica dónde escucha SSH realmente.
 Para cambiar el destino de PDirect-C y HCR juntos: sudo vpsarg-puertos puerto-ssh N
@@ -242,8 +245,11 @@ show_journal() {
   journalctl -u "$UNIT" -n 30 --no-pager >&2 || true
 }
 
-cmd_instalar() {
-  local source="$SOURCE_DEFAULT" sha="$SHA256_DEFAULT" port="" ssh_port="" arch actual version
+# Comprobaciones de instalar (no cambian nada). Deja source, version y las variables HCR_*.
+source="" version=""
+prepare_install() {
+  local sha="$SHA256_DEFAULT" port="" ssh_port="" arch actual
+  source="$SOURCE_DEFAULT"
   while (($#)); do
     case "$1" in
       --binario) [[ $# -ge 2 ]] || fail "--binario requiere una ruta."; source="$2"; shift 2 ;;
@@ -304,6 +310,23 @@ cmd_instalar() {
     confirm "¿Continuar con el destino SSH $HCR_SSH_PORT?" || fail "Cancelado. No se realizaron cambios."
   fi
 
+}
+
+cmd_verificar() {
+  prepare_install "$@"
+  echo "OK: HCR se puede instalar ($version, TCP $HCR_PORT -> 127.0.0.1:$HCR_SSH_PORT). No se cambió nada."
+}
+
+cmd_instalar() {
+  # ---- token: sin un token válido con HCR no se instala nada
+  [[ -r "$TOKEN_LIB" ]] || fail "Falta $TOKEN_LIB: instalá QuickStart con install.sh. No se realizaron cambios."
+  # shellcheck source=vpsarg-token.sh
+  . "$TOKEN_LIB"
+  token_read
+  unset VPSARG_TOKEN
+  token_verify hcr
+  TOKEN=""
+  prepare_install "$@"
   # ---- instalación
   local bdir
   bdir="$(backup)"
@@ -321,6 +344,7 @@ cmd_instalar() {
     show_journal
     fail "HCR no arrancó correctamente. Para quitarlo: sudo vpsarg-hcr desinstalar"
   fi
+  token_mark_used hcr
   echo "OK: $UNIT activo, sin root, escuchando en TCP $HCR_PORT -> 127.0.0.1:$HCR_SSH_PORT ($version)."
   echo "Límites: $HCR_MAX_SESSIONS sesiones globales, $HCR_MAX_SESSIONS_PER_IP por IP, $HCR_MAX_CONNECTIONS conexiones TCP."
   echo "El firewall no se modificó: abrí TCP $HCR_PORT en el proveedor si hace falta."
@@ -422,6 +446,7 @@ main() {
   local action="${1:-}"
   case "$action" in
     instalar) require_root "$@"; shift; cmd_instalar "$@" ;;
+    verificar) require_root "$@"; shift; cmd_verificar "$@" ;;
     estado) (($# == 1)) || { usage; exit 1; }; require_root "$@"; cmd_estado ;;
     iniciar|detener|reiniciar)
       (($# == 1)) || { usage; exit 1; }
