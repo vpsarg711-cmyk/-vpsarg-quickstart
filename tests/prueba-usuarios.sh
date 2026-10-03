@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pruebas de laboratorio de las cuentas SSH (Fase 2C).
+# Pruebas de laboratorio de las cuentas SSH (Fase 2C y etapa 3B).
 # SOLO para una máquina o contenedor de laboratorio con QuickStart instalado:
 # instala sshpass, crea y borra cuentas de prueba, inicia un sshd extra en
 # 127.0.0.1:2223 (sin contraseñas, por línea de comandos) y entra por SSH de verdad,
@@ -63,6 +63,14 @@ wait_sessions() {
   return 1
 }
 close_tunnel() { [[ -n "$TUN" ]] && kill "$TUN" 2>/dev/null; wait "$TUN" 2>/dev/null; TUN=""; }
+# Segunda sesión, sin túnel: bg_session USUARIO CLAVE (deja el PID en BG).
+bg_session() {
+  SSHPASS="$2" sshpass -e ssh "${SSHOPTS[@]}" -N "$1@127.0.0.1" >/dev/null 2>&1 &
+  BG=$!
+}
+uid_procs() { pgrep -u "$1" 2>/dev/null | wc -l; }
+TODAY=$(( $(date +%s) / 86400 ))
+day() { date -u -d "@$(( $1 * 86400 ))" +%F; }
 # Rechazo: ssh termina solo con error antes de 20 s (124 = quedó conectado).
 login_fails() {
   local via="${3:-directo}" port="${4:-22}" proxy=() rc
@@ -146,7 +154,7 @@ check "registro: crear ok" journal_has "accion=crear usuario=ana resultado=ok"
 check "crear ana otra vez falla" bash -c '! echo "$1" | vpsarg-usuarios crear ana >/dev/null 2>&1' _ "$PW"
 check "crear root falla" bash -c '! echo "$1" | vpsarg-usuarios crear root >/dev/null 2>&1' _ "$PW"
 check "crear externo (cuenta ajena existente) falla" bash -c '! echo "$1" | vpsarg-usuarios crear externo >/dev/null 2>&1' _ "$PW"
-check "listar: ana ACTIVO, 0 sesiones, vence nunca" bash -c 'vpsarg-usuarios listar | grep -Eq "^ana +[0-9]+ +ACTIVO +0 +nunca$"'
+check "listar: ana ACTIVO, límite 1, 0 sesiones, vence nunca" bash -c 'vpsarg-usuarios listar | grep -Eq "^ana +[0-9]+ +ACTIVO +1 +0 +nunca$"'
 check "listar no muestra cuentas ajenas" bash -c '! vpsarg-usuarios listar | grep -Eq "^(root|externo) "'
 
 echo "### Autenticación SSH real"
@@ -187,6 +195,86 @@ check "estado ACTIVO" test "$(state_of ana)" = ACTIVO
 check "se borró el vencimiento guardado" bash -c '! grep -q "^ana:" /etc/vpsarg/usuarios-suspendidos'
 check "la contraseña sigue igual" test "$(getent shadow ana | cut -d: -f2)" = "$HASH0"
 check "ana entra otra vez" login_ok ana "$PW"
+close_tunnel
+
+echo "### Etapa 3B: crear con vencimiento y límite"
+check "límite por defecto 1 (ana)" grep -qx "ana:1" /etc/vpsarg/limites
+check "archivo de límites 0600" test "$(stat -c %a /etc/vpsarg/limites)" = 600
+check "crear dani con 30 días y límite 2" bash -c 'echo "$1" | vpsarg-usuarios crear dani 30 2' _ "$PW"
+check "dani vence en 30 días" test "$(expire dani)" = $((TODAY + 30))
+check "límite de dani 2" grep -qx "dani:2" /etc/vpsarg/limites
+check "listar: dani ACTIVO, límite 2, vence en 30 días" bash -c 'vpsarg-usuarios listar | grep -Eq "^dani +[0-9]+ +ACTIVO +2 +0 +$1$"' _ "$(day $((TODAY + 30)))"
+check "registro: crear con vencimiento y límite" journal_has "accion=crear usuario=dani resultado=ok vence=$(day $((TODAY + 30))) limite=2"
+for args in "0" "3651" "x" "30 100" "30 -1" "30 x"; do
+  # shellcheck disable=SC2086
+  check "crear rechaza días/límite '$args'" bash -c '! echo "$1" | vpsarg-usuarios crear eva $2 >/dev/null 2>&1 && ! getent passwd eva >/dev/null' _ "$PW" "$args"
+done
+check "crear con límite 0 = sin límite" bash -c 'echo "$1" | vpsarg-usuarios crear eva 5 0 >/dev/null && vpsarg-usuarios listar | grep -Eq "^eva +[0-9]+ +ACTIVO +- +0 "' _ "$PW"
+check "eliminar eva" u eliminar eva
+
+echo "### Etapa 3B: renovar y vencimiento"
+check "renovar dani 10: suma desde su vencimiento" bash -c 'vpsarg-usuarios renovar dani 10 >/dev/null && [[ "$(getent shadow dani | cut -d: -f8)" == "$1" ]]' _ $((TODAY + 40))
+check "renovar ana 5 (sin vencimiento): desde hoy" bash -c 'vpsarg-usuarios renovar ana 5 >/dev/null && [[ "$(getent shadow ana | cut -d: -f8)" == "$1" ]]' _ $((TODAY + 5))
+check "registro: renovar ok" journal_has "accion=renovar usuario=dani resultado=ok vence=$(day $((TODAY + 40)))"
+check "renovar rechaza días inválidos" bash -c '! vpsarg-usuarios renovar dani 0 >/dev/null 2>&1 && ! vpsarg-usuarios renovar dani abc >/dev/null 2>&1 && [[ "$(getent shadow dani | cut -d: -f8)" == "$1" ]]' _ $((TODAY + 40))
+check "renovar root y externo se niega" bash -c '! vpsarg-usuarios renovar root 5 >/dev/null 2>&1 && ! vpsarg-usuarios renovar externo 5 >/dev/null 2>&1 && [[ -z "$(getent shadow externo | cut -d: -f8)" ]]'
+check "vencimiento dani 2030-01-15" bash -c 'vpsarg-usuarios vencimiento dani 2030-01-15 >/dev/null && [[ "$(getent shadow dani | cut -d: -f8)" == $(( $(date -u -d 2030-01-15 +%s) / 86400 )) ]]'
+check "vencimiento ana nunca" bash -c 'vpsarg-usuarios vencimiento ana nunca >/dev/null && [[ -z "$(getent shadow ana | cut -d: -f8)" ]]'
+check "vencimiento rechaza fecha inválida, hoy o pasada" bash -c 'for d in 2030-02-30 2030-1-1 "$(date -u +%F)" 2020-01-01 mañana; do vpsarg-usuarios vencimiento dani "$d" >/dev/null 2>&1 && exit 1; done; true'
+login_ok dani "$PW"
+chage -E "$TODAY" dani   # simula que hoy es el día del vencimiento
+check "el día del vencimiento: estado VENCIDO" test "$(state_of dani)" = VENCIDO
+check "vencida: la sesión abierta sigue" bash -c "sleep 2; kill -0 $TUN 2>/dev/null"
+check "vencida: no entra una conexión nueva" login_fails dani "$PW"
+close_tunnel
+check "renovar una cuenta vencida: desde hoy" bash -c 'vpsarg-usuarios renovar dani 3 >/dev/null && [[ "$(getent shadow dani | cut -d: -f8)" == "$1" ]] && [[ "$(vpsarg-usuarios listar | awk "\$1==\"dani\"{print \$3}")" == ACTIVO ]]' _ $((TODAY + 3))
+check "renovada: entra otra vez" login_ok dani "$PW"
+close_tunnel
+check "suspender dani" u suspender dani
+check "suspendida: renovar guarda el vencimiento sin reactivarla" bash -c 'vpsarg-usuarios renovar dani 7 >/dev/null && [[ "$(getent shadow dani | cut -d: -f8)" == 0 ]] && grep -qx "dani:$1" /etc/vpsarg/usuarios-suspendidos' _ $((TODAY + 10))
+check "reactivar aplica el vencimiento renovado" bash -c 'vpsarg-usuarios reactivar dani >/dev/null && [[ "$(getent shadow dani | cut -d: -f8)" == "$1" ]]' _ $((TODAY + 10))
+
+echo "### Etapa 3B: cambiar contraseña"
+HASHD="$(getent shadow dani | cut -d: -f2)"
+check "clave rechaza una contraseña corta" bash -c '! echo abc | vpsarg-usuarios clave dani >/dev/null 2>&1 && [[ "$(getent shadow dani | cut -d: -f2)" == "$1" ]]' _ "$HASHD"
+check "clave de root y externo se niega" bash -c '! echo "$1" | vpsarg-usuarios clave root >/dev/null 2>&1 && ! echo "$1" | vpsarg-usuarios clave externo >/dev/null 2>&1' _ "$PW2"
+login_ok dani "$PW"
+check "cambiar la contraseña de dani" bash -c 'echo "$1" | vpsarg-usuarios clave dani >/dev/null' _ "$PW2"
+check "la contraseña cambió" bash -c '[[ "$(getent shadow dani | cut -d: -f2)" != "$1" ]]' _ "$HASHD"
+check "cambiar la contraseña no cierra la sesión abierta" bash -c "kill -0 $TUN 2>/dev/null"
+close_tunnel
+check "la contraseña vieja ya no entra" login_fails dani "$PW"
+check "la nueva entra" login_ok dani "$PW2"
+close_tunnel
+check "registro: clave ok sin la contraseña" bash -c 'journalctl -t vpsarg-panel -o cat | grep -q "accion=clave usuario=dani resultado=ok" && ! journalctl -o cat | grep -qF "$1"' _ "$PW2"
+
+echo "### Etapa 3B: límite de conexiones (se guarda; se aplica en 3C)"
+check "limite dani muestra 2" bash -c 'vpsarg-usuarios limite dani | grep -q "límite 2"'
+check "limite dani 5" bash -c 'vpsarg-usuarios limite dani 5 >/dev/null && grep -qx "dani:5" /etc/vpsarg/limites'
+check "limite rechaza 100, -1 y texto" bash -c 'for n in 100 -1 x; do vpsarg-usuarios limite dani "$n" >/dev/null 2>&1 && exit 1; done; grep -qx "dani:5" /etc/vpsarg/limites'
+check "limite de root y externo se niega" bash -c '! vpsarg-usuarios limite root 2 >/dev/null 2>&1 && ! vpsarg-usuarios limite externo 2 >/dev/null 2>&1 && ! grep -q "^\(root\|externo\):" /etc/vpsarg/limites'
+login_ok dani "$PW2"
+bg_session dani "$PW2"
+check "dos sesiones de dani" wait_sessions dani 2
+check "bajar el límite a 1 no cierra ninguna sesión" bash -c "vpsarg-usuarios limite dani 1 >/dev/null; sleep 2; kill -0 $TUN 2>/dev/null && kill -0 $BG 2>/dev/null"
+check "Estado marca a dani 2/1 EXCEDE" bash -c 'vpsarg sistema | grep -qE "^  dani +2/1  EXCEDE$"'
+kill "$BG" 2>/dev/null; wait "$BG" 2>/dev/null
+check "limite dani 0 = sin límite" bash -c 'vpsarg-usuarios limite dani 0 >/dev/null && vpsarg-usuarios limite dani | grep -q "sin límite" && vpsarg-usuarios listar | grep -Eq "^dani +[0-9]+ +ACTIVO +- "'
+check "registro: limite ok" journal_has "accion=limite usuario=dani resultado=ok limite=0"
+
+echo "### Etapa 3B: eliminar justo después de una sesión (systemd --user)"
+login_ok ana "$PW"          # sesión de otra cuenta que tiene que seguir
+ANA_TUN="$TUN"
+TUN=""
+login_ok dani "$PW2"
+DUID="$(id -u dani)"
+close_tunnel
+check "eliminar dani enseguida de cerrar su sesión" u eliminar dani
+check "dani no existe y no quedan procesos de su UID" bash -c '! getent passwd dani >/dev/null && [[ $(pgrep -u "$1" | wc -l) == 0 ]]' _ "$DUID"
+check "se borró su límite" bash -c '! grep -q "^dani:" /etc/vpsarg/limites'
+check "la sesión de ana siguió abierta" bash -c "kill -0 $ANA_TUN 2>/dev/null && [[ \$(vpsarg-usuarios listar | awk '\$1==\"ana\"{print \$(NF-1)}') == 1 ]]"
+check "externo sigue intacto" bash -c 'getent passwd externo >/dev/null'
+TUN="$ANA_TUN"
 close_tunnel
 check "reactivar otra vez: sin cambios" bash -c 'vpsarg-usuarios reactivar ana | grep -q "no estaba suspendida"'
 chage -E 2030-01-01 ana
@@ -234,30 +322,52 @@ check "registro: eliminar ok" journal_has "accion=eliminar usuario=ana resultado
 check "eliminar otra vez falla" bash -c '! vpsarg-usuarios eliminar ana >/dev/null 2>&1'
 
 echo "### Desde el menú del panel"
-printf '2\n1\nbeto\n%s\n\n0\n0\n' "$PW" | timeout 60 vpsarg > "$OUT" 2>&1
+printf '2\n1\nbeto\n\n\n%s\n\n0\n0\n' "$PW" | timeout 60 vpsarg > "$OUT" 2>&1
 check "panel: crear beto" bash -c 'getent passwd beto >/dev/null && id -nG beto | grep -qw vpsarg-usuarios'
+check "panel: por defecto vence en 30 días y límite 1" bash -c '[[ "$(getent shadow beto | cut -d: -f8)" == "$1" ]] && grep -qx "beto:1" /etc/vpsarg/limites' _ $((TODAY + 30))
 check "panel: beto entra" login_ok beto "$PW"
-check "estado: beto figura conectado con 1 sesión" bash -c 'vpsarg sistema | grep -qE "^  beto +1$"'
+check "estado: beto figura conectado 1/1" bash -c 'vpsarg sistema | grep -qE "^  beto +1/1$"'
 check "estado: cuenta 1 usuario conectado" bash -c 'vpsarg sistema | grep -q "^Usuarios conectados: 1 · sesiones SSH: 1$"'
 close_tunnel
 check "estado: beto ya no figura conectado" bash -c 'sleep 1; ! vpsarg sistema | grep -qE "^  beto "'
 printf '2\n1\nB;ad\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
 check "panel: nombre inválido" has "Nombre no válido"
-printf '2\n3\nbeto\nn\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
+printf '2\n1\ncora\nabc\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
+check "panel: días inválidos no crean la cuenta" bash -c 'grep -q "Días no válidos" '"$OUT"' && ! getent passwd cora >/dev/null'
+printf '2\n1\ncora\n0\n3\n%s\n\n0\n0\n' "$PW" | timeout 60 vpsarg > "$OUT" 2>&1
+check "panel: crear con 0 días (no vence) y límite 3" bash -c '[[ -z "$(getent shadow cora | cut -d: -f8)" ]] && grep -qx "cora:3" /etc/vpsarg/limites'
+printf '2\n3\nbeto\n15\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
+check "panel: renovar beto 15 días" test "$(expire beto)" = $((TODAY + 45))
+printf '2\n4\nbeto\nnunca\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
+check "panel: vencimiento nunca" test -z "$(expire beto)"
+printf '2\n4\nbeto\n15/01/2030\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
+check "panel: fecha con otro formato se rechaza" bash -c 'grep -q "Fecha no válida" '"$OUT"' && [[ -z "$(getent shadow beto | cut -d: -f8)" ]]'
+HASHB="$(getent shadow beto | cut -d: -f2)"
+printf '2\n5\nbeto\n%s\n\n0\n0\n' "$PW2" | timeout 60 vpsarg > "$OUT" 2>&1
+check "panel: cambiar contraseña" bash -c '[[ "$(getent shadow beto | cut -d: -f2)" != "$1" ]] && ! grep -qF "$2" '"$OUT"'' _ "$HASHB" "$PW2"
+check "panel: entra con la nueva contraseña" login_ok beto "$PW2"
+close_tunnel
+printf '2\n6\nbeto\n10\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
+check "panel: cambiar límite a 10" bash -c 'grep -q "límite 1" '"$OUT"' && grep -qx "beto:10" /etc/vpsarg/limites'
+printf '2\n6\nbeto\nx\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
+check "panel: límite inválido se rechaza" bash -c 'grep -q "Límite no válido" '"$OUT"' && grep -qx "beto:10" /etc/vpsarg/limites'
+printf '2\n7\nbeto\nn\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
 check "panel: responder n no suspende" test -z "$(expire beto)"
-printf '2\n3\nbeto\ns\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
+printf '2\n7\nbeto\ns\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
 check "panel: suspender beto" test "$(expire beto)" = 0
 check "panel: el listado muestra SUSPENDIDO" has "beto .*SUSPENDIDO"
-printf '2\n4\nbeto\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
+printf '2\n8\nbeto\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
 check "panel: reactivar beto" test -z "$(expire beto)"
-printf '2\n5\nbeto\nbetx\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
+printf '2\n9\nbeto\nbetx\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
 check "panel: confirmación distinta no elimina" bash -c 'getent passwd beto >/dev/null'
-printf '2\n5\nbeto\nbeto\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
+printf '2\n9\nbeto\nbeto\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
 check "panel: eliminar beto" bash -c '! getent passwd beto >/dev/null'
+printf '2\n9\ncora\ncora\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
+check "panel: eliminar cora" bash -c '! getent passwd cora >/dev/null && ! grep -q "^cora:" /etc/vpsarg/limites'
 
 echo "### Lo que no debe cambiar"
 userdel -r externo >/dev/null 2>&1
-check "no quedan cuentas de prueba" bash -c '! getent passwd ana beto carla externo >/dev/null'
+check "no quedan cuentas de prueba" bash -c '! getent passwd ana beto carla cora dani eva externo >/dev/null'
 check "contraseñas fuera del registro" bash -c '! journalctl -o cat | grep -qF -e "$1" -e "$2"' _ "$PW" "$PW2"
 check "contraseñas fuera de /etc/vpsarg y /var/log" bash -c '! grep -rqF -e "$1" /etc/vpsarg /var/log 2>/dev/null' _ "$PW"
 check "UDPGW no se reinició (PID $UG_PID0)" test "$(pid_of udpgw-7300)" = "$UG_PID0"

@@ -132,7 +132,11 @@ Los usuarios finales son cuentas Linux normales y entran con **usuario y contras
 ```bash
 sudo vpsarg-usuarios listar
 sudo vpsarg-usuarios ver USUARIO
-sudo vpsarg-usuarios crear USUARIO        # pide la contraseña dos veces, sin mostrarla
+sudo vpsarg-usuarios crear USUARIO [DÍAS] [LÍMITE]   # pide la contraseña dos veces, sin mostrarla
+sudo vpsarg-usuarios renovar USUARIO DÍAS
+sudo vpsarg-usuarios vencimiento USUARIO AAAA-MM-DD|nunca
+sudo vpsarg-usuarios clave USUARIO        # nueva contraseña, sin mostrarla
+sudo vpsarg-usuarios limite USUARIO [N]   # muestra o cambia el máximo de conexiones (0 = sin límite)
 sudo vpsarg-usuarios suspender USUARIO
 sudo vpsarg-usuarios reactivar USUARIO
 sudo vpsarg-usuarios eliminar USUARIO
@@ -140,11 +144,17 @@ sudo vpsarg-usuarios eliminar USUARIO
 
 | Acción | Qué hace |
 |---|---|
-| Crear | `useradd -m -k /dev/null -s /usr/sbin/nologin -G vpsarg-usuarios USUARIO` y la contraseña por la entrada estándar de `chpasswd`. Sin shell: sirve para túneles (`ssh -N`), no para entrar a una consola |
+| Crear | `useradd -m -k /dev/null -s /usr/sbin/nologin -G vpsarg-usuarios USUARIO` y la contraseña por la entrada estándar de `chpasswd`. Sin shell: sirve para túneles (`ssh -N`), no para entrar a una consola. Con DÍAS, `chage -E` (hoy + DÍAS). LÍMITE por defecto 1 |
+| Renovar | Suma DÍAS desde hoy o desde el vencimiento actual, el que sea mayor. Si está suspendida, actualiza el vencimiento guardado y sigue suspendida |
+| Vencimiento | Pone una fecha exacta (posterior a hoy) o `nunca` |
+| Cambiar contraseña | `chpasswd` por la entrada estándar. Las sesiones abiertas siguen |
+| Límite | Guarda el máximo de conexiones en `/etc/vpsarg/limites` (0600). **Todavía no se aplica**: cambiarlo no cierra ninguna sesión |
 | Suspender | Guarda el vencimiento actual en `/etc/vpsarg/usuarios-suspendidos` (0600), aplica `chage -E 0` y cierra las sesiones SSH abiertas con SIGTERM. La contraseña no se toca |
 | Reactivar | Restaura el vencimiento guardado con `chage -E` (o sin vencimiento si no había) y borra la línea guardada |
-| Eliminar | Cierra las sesiones con SIGTERM y ejecuta `userdel -r` |
-| Listar / ver | Estado (ACTIVO, SUSPENDIDO, VENCIDO, CONTRASEÑA BLOQUEADA), sesiones SSH abiertas y vencimiento. Nunca muestra contraseñas |
+| Eliminar | Cierra las sesiones con SIGTERM, espera a que no quede ningún proceso de la cuenta (si solo queda su `systemd --user`, detiene `user@UID.service` de esa cuenta) y ejecuta `userdel -r` |
+| Listar / ver | Estado (ACTIVO, SUSPENDIDO, VENCIDO, CONTRASEÑA BLOQUEADA), límite, sesiones SSH abiertas y vencimiento. Nunca muestra contraseñas |
+
+**Vencimiento**: desde el día indicado (inclusive) la cuenta no puede iniciar sesiones nuevas; las que ya están abiertas siguen hasta que se desconectan.
 
 - Solo administra cuentas del grupo `vpsarg-usuarios` con UID 1000 o mayor. No toca `root` ni otras cuentas del servidor.
 - Nombres: minúsculas, números, `_` o `-`, empiezan con letra o `_`, hasta 31 caracteres. Contraseñas: 6 a 128 caracteres, sin `:`.

@@ -19,6 +19,7 @@ KNOWN_UNITS=(pdirect-80 udpgw-7300 hcr-8880)
 PROTOCOLS=(pdirect-80 udpgw-7300 hcr-8880 ssh)
 USERS_GROUP="vpsarg-usuarios"
 # AUTO: cuentas que abren el panel al iniciar sesión y el disparador que lo hace.
+LIMITS_FILE="/etc/vpsarg/limites"
 AUTO_CONF="/etc/vpsarg-auto.conf"
 AUTO_HOOK="/etc/profile.d/vpsarg-auto.sh"
 
@@ -594,12 +595,21 @@ show_sistema() {
   printf '%-10s %s\n' "TEMP:" "$(temperature)"
 }
 
+# Límites guardados por vpsarg-usuarios (usuario:N; 0 o sin línea = sin límite).
+limits_map() {
+  [[ -r "$LIMITS_FILE" ]] && grep -E '^[a-z_][a-z0-9_-]*:[0-9]+$' "$LIMITS_FILE" | tr ':' ' ' | tr '\n' ' '
+  return 0
+}
+
 show_conectados() {
   local list n
   list="$(managed_sessions | awk '$2 > 0')"
   n="$(grep -c . <<<"$list" || true)"
   echo "Usuarios conectados: $n · sesiones SSH: $(awk '{t += $2} END {print t + 0}' <<<"$list")"
-  [[ -n "$list" ]] && awk '{printf "  %-20s %s\n", $1, $2}' <<<"$list"
+  [[ -n "$list" ]] && awk -v map="$(limits_map)" '
+    BEGIN { k = split(map, a, " "); for (i = 1; i < k; i += 2) lim[a[i]] = a[i + 1] }
+    { l = ($1 in lim && lim[$1] > 0) ? lim[$1] : "-"
+      printf "  %-20s %s/%s%s\n", $1, $2, l, (l != "-" && $2 > l) ? "  EXCEDE" : "" }' <<<"$list"
   return 0
 }
 
@@ -778,7 +788,7 @@ menu_configuracion() {
 }
 
 menu_usuarios() {
-  local u
+  local u opt days limit
   [[ -x "$USUARIOS" ]] || { pending "USUARIOS SSH" "No está instalado $USUARIOS."; return; }
   while true; do
     banner
@@ -789,21 +799,45 @@ menu_usuarios() {
     fi
     "$USUARIOS" listar 2>&1 || true
     echo
-    echo "  1) Crear   2) Ver   3) Suspender   4) Reactivar   5) Eliminar   0) Volver"
+    echo "  1) Crear              2) Ver                 3) Renovar"
+    echo "  4) Cambiar vencimiento 5) Cambiar contraseña  6) Cambiar límite"
+    echo "  7) Suspender          8) Reactivar           9) Eliminar"
+    echo "  0) Volver"
     ask "Opción: "
     case "$REPLY" in
-      1|2|3|4|5)
-        local opt="$REPLY"
+      [1-9])
+        opt="$REPLY"
         ask "Usuario: "
         valid_user "$REPLY" || { echo "Nombre no válido (minúsculas, números, _ o -; máximo 31)."; pause; continue; }
         u="$REPLY"
         case "$opt" in
-          1) echo "La contraseña no se muestra mientras la escribís (mínimo 6 caracteres)."
-             "$USUARIOS" crear "$u" || true ;;
+          1) ask "Días de vigencia (Enter = 30; 0 = no vence): "
+             days="${REPLY:-30}"
+             [[ "$days" =~ ^[0-9]{1,4}$ ]] || { echo "Días no válidos."; pause; continue; }
+             [[ "$days" == 0 ]] && days=""
+             echo "Límite de conexiones: [1] [2] [3] [5] [10] o 0 = sin límite."
+             ask "Límite (Enter = 1): "
+             limit="${REPLY:-1}"
+             [[ "$limit" =~ ^[0-9]{1,2}$ ]] || { echo "Límite no válido."; pause; continue; }
+             echo "La contraseña no se muestra mientras la escribís (mínimo 6 caracteres)."
+             "$USUARIOS" crear "$u" "$days" "$limit" || true ;;
           2) "$USUARIOS" ver "$u" || true ;;
-          3) confirm "¿Suspender $u? Se cierran sus sesiones SSH abiertas." && { "$USUARIOS" suspender "$u" || true; } ;;
-          4) "$USUARIOS" reactivar "$u" || true ;;
-          5) ask "Para eliminar $u y su directorio personal, escribí el nombre otra vez: "
+          3) ask "Días a sumar (desde hoy o desde el vencimiento actual, el mayor): "
+             [[ "$REPLY" =~ ^[0-9]{1,4}$ ]] || { echo "Días no válidos."; pause; continue; }
+             "$USUARIOS" renovar "$u" "$REPLY" || true ;;
+          4) ask "Nueva fecha de vencimiento (AAAA-MM-DD) o nunca: "
+             [[ "$REPLY" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2}|nunca)$ ]] || { echo "Fecha no válida."; pause; continue; }
+             "$USUARIOS" vencimiento "$u" "$REPLY" || true ;;
+          5) echo "La contraseña no se muestra mientras la escribís (mínimo 6 caracteres)."
+             "$USUARIOS" clave "$u" || true ;;
+          6) "$USUARIOS" limite "$u" || { pause; continue; }
+             echo "Nuevo límite: [1] [2] [3] [5] [10] o 0 = sin límite."
+             ask "Límite: "
+             [[ "$REPLY" =~ ^[0-9]{1,2}$ ]] || { echo "Límite no válido."; pause; continue; }
+             "$USUARIOS" limite "$u" "$REPLY" || true ;;
+          7) confirm "¿Suspender $u? Se cierran sus sesiones SSH abiertas." && { "$USUARIOS" suspender "$u" || true; } ;;
+          8) "$USUARIOS" reactivar "$u" || true ;;
+          9) ask "Para eliminar $u y su directorio personal, escribí el nombre otra vez: "
              if [[ "$REPLY" == "$u" ]]; then "$USUARIOS" eliminar "$u" || true; else echo "No coincide. No se eliminó."; fi ;;
         esac
         pause
