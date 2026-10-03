@@ -259,6 +259,7 @@ check "dos sesiones de dani" wait_sessions dani 2
 check "bajar el límite a 1 no cierra ninguna sesión" bash -c "vpsarg-usuarios limite dani 1 >/dev/null; sleep 2; kill -0 $TUN 2>/dev/null && kill -0 $BG 2>/dev/null"
 check "Estado marca a dani 2/1 EXCEDE" bash -c 'vpsarg sistema | grep -qE "^  dani +2/1  EXCEDE$"'
 kill "$BG" 2>/dev/null; wait "$BG" 2>/dev/null
+close_tunnel
 check "limite dani 0 = sin límite" bash -c 'vpsarg-usuarios limite dani 0 >/dev/null && vpsarg-usuarios limite dani | grep -q "sin límite" && vpsarg-usuarios listar | grep -Eq "^dani +[0-9]+ +ACTIVO +- "'
 check "registro: limite ok" journal_has "accion=limite usuario=dani resultado=ok limite=0"
 
@@ -266,13 +267,16 @@ echo "### Etapa 3B: eliminar justo después de una sesión (systemd --user)"
 login_ok ana "$PW"          # sesión de otra cuenta que tiene que seguir
 ANA_TUN="$TUN"
 TUN=""
-login_ok dani "$PW2"
+bg_session dani "$PW2"      # sin túnel: el puerto 19000 lo usa la sesión de ana
+check "dani con 1 sesión" wait_sessions dani 1
 DUID="$(id -u dani)"
-close_tunnel
+kill "$BG" 2>/dev/null; wait "$BG" 2>/dev/null
 check "eliminar dani enseguida de cerrar su sesión" u eliminar dani
 check "dani no existe y no quedan procesos de su UID" bash -c '! getent passwd dani >/dev/null && [[ $(pgrep -u "$1" | wc -l) == 0 ]]' _ "$DUID"
 check "se borró su límite" bash -c '! grep -q "^dani:" /etc/vpsarg/limites'
-check "la sesión de ana siguió abierta" bash -c "kill -0 $ANA_TUN 2>/dev/null && [[ \$(vpsarg-usuarios listar | awk '\$1==\"ana\"{print \$(NF-1)}') == 1 ]]"
+check "el túnel de ana siguió abierto" bash -c "kill -0 $ANA_TUN 2>/dev/null"
+check "ana sigue con 1 sesión" wait_sessions ana 1
+echo "      sesiones de ana: $(sessions_of ana) (${WAITED} s)"
 check "externo sigue intacto" bash -c 'getent passwd externo >/dev/null'
 TUN="$ANA_TUN"
 close_tunnel
