@@ -19,6 +19,15 @@ PASS_MAX=128
 DAYS_MAX=3650
 LIMIT_DEFAULT=1
 LIMIT_MAX=99
+# Control del límite (etapa 3C): pam_exec en la fase account de sshd.
+PAM_SSHD="/etc/pam.d/sshd"
+PAM_BACKUP="$STATE_DIR/pam-sshd.antes-del-limite"
+LIMIT_HOOK="/usr/local/sbin/vpsarg-limite"
+SESSIONS_DIR="/run/vpsarg/sesiones"
+PAM_MARK="# VPS ARG: límite de conexiones por usuario (se quita con: vpsarg-usuarios control off)"
+PAM_LINE1="account [success=1 default=ignore] pam_succeed_if.so quiet user notingroup $GROUP"
+PAM_LINE2="account required pam_exec.so stdout quiet $LIMIT_HOOK"
+VERIFY_USER="vpsarg-verif"
 
 usage() {
   cat <<'EOF'
@@ -35,9 +44,12 @@ Uso:
   sudo vpsarg-usuarios suspender USUARIO    (chage -E 0 y cierra sus sesiones SSH)
   sudo vpsarg-usuarios reactivar USUARIO    (restaura el vencimiento anterior)
   sudo vpsarg-usuarios eliminar USUARIO     (cierra sus sesiones y userdel -r)
+  sudo vpsarg-usuarios control [on|off]     (aplica los límites con PAM; sin argumento muestra el estado)
 
 Vencimiento: la cuenta no puede entrar desde el día indicado (inclusive). Las sesiones ya
-abiertas siguen hasta que se desconecten. El límite se guarda pero todavía no se aplica.
+abiertas siguen hasta que se desconecten.
+Límite: con el control activo, una conexión nueva se rechaza si la cuenta ya tiene su
+máximo de conexiones abiertas. Las conexiones existentes nunca se cierran.
 EOF
 }
 
@@ -158,6 +170,14 @@ limit_text() {
   if [[ -z "$l" || "$l" == 0 ]]; then echo "sin límite"; else echo "$l"; fi
 }
 
+control_active() {
+  [[ -r "$PAM_SSHD" ]] && grep -qxF -- "$PAM_LINE2" "$PAM_SSHD"
+}
+
+control_text() {
+  if control_active; then echo "se aplica"; else echo "no se aplica: control de límites desactivado"; fi
+}
+
 valid_days() {
   [[ "$1" =~ ^[1-9][0-9]{0,3}$ ]] && (($1 <= DAYS_MAX))
 }
@@ -230,7 +250,7 @@ cmd_listar() {
   done <<<"$members"
   echo
   echo "SESIONES = sesiones SSH autenticadas (por SSH directo, PDirect-C o HCR)."
-  echo "LÍMITE = máximo de conexiones guardado (- = sin límite); todavía no se aplica."
+  echo "LÍMITE = máximo de conexiones (- = sin límite); $(control_text)."
   echo "VENCE = desde ese día la cuenta no puede entrar. El consumo todavía no se mide."
 }
 
@@ -246,7 +266,7 @@ cmd_ver() {
   else
     echo "Vence:     $(days_to_date "$exp")"
   fi
-  echo "Límite:    $(limit_text "$user") (todavía no se aplica)"
+  echo "Límite:    $(limit_text "$user") ($(control_text))"
   echo "Home:      $(getent passwd "$user" | cut -d: -f6)"
   echo "Shell:     $(getent passwd "$user" | cut -d: -f7)"
   pids="$(session_pids "$user" | tr '\n' ' ')"
@@ -414,6 +434,200 @@ cmd_eliminar() {
   echo "Cuenta $user eliminada (con su directorio personal)."
 }
 
+# ------------------------------------------------------------------ control del límite (3C)
+# El script que llama pam_exec. Corre en el proceso monitor de cada conexión SSH nueva
+# de las cuentas del grupo, después de validar la contraseña y antes de abrir la sesión.
+write_limit_hook() {
+  local tmp
+  tmp="$(mktemp "${LIMIT_HOOK%/*}/.vpsarg-limite.XXXXXX")" || return 1
+  cat > "$tmp" <<'EOF'
+#!/bin/bash
+# VPS ARG QuickStart - límite de conexiones por usuario (pam_exec, fase account de sshd).
+# Lo escribe "vpsarg-usuarios control on" y lo borra "control off". Si la cuenta ya tiene
+# su máximo de conexiones, rechaza la nueva; nunca cierra las existentes.
+# Cada conexión aceptada queda registrada como /run/vpsarg/sesiones/USUARIO/PID con la hora
+# de inicio del proceso monitor de sshd; los registros de monitores terminados se borran.
+# Ante cualquier error inesperado deja pasar (solo rechaza por el límite).
+LIMITS=/etc/vpsarg/limites
+REG=/run/vpsarg/sesiones
+u="${PAM_USER:-}"
+[[ "${PAM_TYPE:-}" == account && "$u" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || exit 0
+max="$(sed -n "s/^$u:\([0-9]\{1,2\}\)$/\1/p" "$LIMITS" 2>/dev/null | tail -n 1)"
+[[ -n "$max" && "$max" != 0 ]] || exit 0
+# Hora de inicio del proceso (campo 22 de /proc/PID/stat): distingue PID reutilizados.
+starttime() {
+  local s
+  [[ "$1" =~ ^[0-9]+$ ]] && s="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+  s="${s##*) }"
+  set -- $s
+  echo "${20}"
+}
+mon="$PPID"
+if [[ "$(cat "/proc/$mon/comm" 2>/dev/null)" != sshd* ]]; then
+  logger -t vpsarg-limite "aviso usuario=$u el proceso padre no es sshd; se deja pasar"
+  exit 0
+fi
+mst="$(starttime "$mon")" || exit 0
+mkdir -p -m 0700 "$REG/$u" 2>/dev/null || exit 0
+exec 8> "$REG/.lock" && flock -w 5 8 || exit 0
+n=0
+for f in "$REG/$u"/*; do
+  [[ -f "$f" ]] || continue
+  p="${f##*/}"
+  [[ "$p" == "$mon" ]] && continue
+  if [[ "$(starttime "$p")" == "$(cat "$f" 2>/dev/null)" ]]; then n=$((n + 1)); else rm -f -- "$f"; fi
+done
+if ((n >= max)); then
+  logger -t vpsarg-limite "rechazada usuario=$u actuales=$n limite=$max"
+  echo "CONEXION RECHAZADA: limite de conexiones alcanzado ($n/$max)"
+  exit 1
+fi
+echo "$mst" > "$REG/$u/$mon" || exit 0
+logger -t vpsarg-limite "aceptada usuario=$u actuales=$((n + 1)) limite=$max"
+exit 0
+EOF
+  if ! bash -n "$tmp" || ! chmod 0755 "$tmp" || ! mv -f "$tmp" "$LIMIT_HOOK"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+# Registra las conexiones que ya estaban abiertas al activar el control, para que cuenten.
+# Monitor de cada conexión: proceso de root "sshd: USUARIO [priv]".
+register_open_sessions() {
+  local pid user
+  install -d -m 0700 "${SESSIONS_DIR%/*}" "$SESSIONS_DIR"
+  while read -r pid user; do
+    managed "$user" || continue
+    install -d -m 0700 "$SESSIONS_DIR/$user"
+    awk '{sub(/.*\) /, ""); print $20}' "/proc/$pid/stat" > "$SESSIONS_DIR/$user/$pid" 2>/dev/null || rm -f -- "$SESSIONS_DIR/$user/$pid"
+  done < <(ps -eo pid=,uid=,args= | awk '$2 == 0 && ($3 == "sshd:" || $3 == "sshd-session:") && $5 == "[priv]" && NF == 5 {print $1, $4}')
+}
+
+# pam_lines add|remove: escribe /etc/pam.d/sshd con o sin las líneas del control.
+pam_lines() {
+  local tmp
+  tmp="$(mktemp "${PAM_SSHD%/*}/.vpsarg-sshd.XXXXXX")" || return 1
+  if [[ "$1" == add ]]; then
+    awk -v m="$PAM_MARK" -v l1="$PAM_LINE1" -v l2="$PAM_LINE2" \
+      '{print} $0 == "@include common-account" {print m; print l1; print l2}' "$PAM_SSHD" > "$tmp"
+  else
+    grep -vxF -e "$PAM_MARK" -e "$PAM_LINE1" -e "$PAM_LINE2" "$PAM_SSHD" > "$tmp"
+  fi
+  if ! chmod 0644 "$tmp" || ! mv -f "$tmp" "$PAM_SSHD"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+# Prueba real: una cuenta temporal del grupo con límite 1 entra por SSH con clave a
+# 127.0.0.1; con esa conexión abierta, una segunda tiene que ser rechazada y la primera seguir.
+verify_limit() {
+  local dir port p1 rc _ ok=1 opts
+  port="$(sed -n 's/^SSH_PORT=\([0-9]*\)$/\1/p' /etc/vpsarg-pdirect.conf 2>/dev/null)"
+  port="${port:-22}"
+  dir="$(mktemp -d /run/vpsarg-verif.XXXXXX)" || return 1
+  chmod 0755 "$dir"
+  if ! useradd -M -d "$dir/home" -s "$SHELL_NOLOGIN" -G "$GROUP" "$VERIFY_USER" 2>/dev/null; then
+    rm -rf -- "$dir"
+    VERIFY_ERR="no se pudo crear la cuenta temporal $VERIFY_USER"
+    return 1
+  fi
+  install -d -m 0700 -o "$VERIFY_USER" -g "$VERIFY_USER" "$dir/home" "$dir/home/.ssh"
+  ssh-keygen -q -t ed25519 -N '' -C vpsarg-verif -f "$dir/clave" >/dev/null
+  install -m 0600 -o "$VERIFY_USER" -g "$VERIFY_USER" "$dir/clave.pub" "$dir/home/.ssh/authorized_keys"
+  set_limit "$VERIFY_USER" 1
+  opts=(-i "$dir/clave" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=no
+        -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -p "$port")
+  ssh "${opts[@]}" -N "$VERIFY_USER@127.0.0.1" </dev/null >/dev/null 2>&1 &
+  p1=$!
+  VERIFY_ERR="la cuenta temporal no pudo entrar por SSH con clave a 127.0.0.1:$port"
+  for _ in $(seq 30); do
+    if [[ -n "$(session_pids "$VERIFY_USER")" ]]; then ok=0; break; fi
+    kill -0 "$p1" 2>/dev/null || break
+    sleep 0.5
+  done
+  if ((ok == 0)); then
+    rc=0
+    timeout 20 ssh "${opts[@]}" -N "$VERIFY_USER@127.0.0.1" </dev/null >/dev/null 2>&1 || rc=$?
+    if ((rc == 0 || rc == 124)); then
+      ok=1; VERIFY_ERR="una segunda conexión con límite 1 no fue rechazada"
+    elif ! kill -0 "$p1" 2>/dev/null || [[ "$(session_pids "$VERIFY_USER" | wc -l)" != 1 ]]; then
+      ok=1; VERIFY_ERR="la primera conexión no siguió abierta después del rechazo"
+    fi
+  fi
+  kill "$p1" 2>/dev/null || true
+  wait "$p1" 2>/dev/null || true
+  close_sessions "$VERIFY_USER" >/dev/null || true
+  release_uid "$(id -u "$VERIFY_USER")" || true
+  userdel "$VERIFY_USER" >/dev/null 2>&1 || { ok=1; VERIFY_ERR="no se pudo borrar la cuenta temporal $VERIFY_USER"; }
+  set_limit "$VERIFY_USER"
+  rm -rf -- "$dir" "${SESSIONS_DIR:?}/$VERIFY_USER"
+  return "$ok"
+}
+
+control_show() {
+  if control_active; then
+    echo "Control de límites: ACTIVO (las conexiones nuevas que superan el límite se rechazan)."
+  else
+    echo "Control de límites: INACTIVO (los límites se guardan pero no se aplican)."
+  fi
+}
+
+control_on() {
+  local n
+  if control_active; then control_show; return 0; fi
+  [[ -f "$PAM_SSHD" ]] || fail control - "no existe $PAM_SSHD"
+  n="$(grep -cx '@include common-account' "$PAM_SSHD" || true)"
+  [[ "$n" == 1 ]] || fail control - "$PAM_SSHD no tiene exactamente una línea '@include common-account'; no se modifica"
+  grep -qF -e "$PAM_LINE1" -e "$LIMIT_HOOK" "$PAM_SSHD" && fail control - "$PAM_SSHD tiene líneas del control incompletas; revisalo a mano"
+  [[ "$(sshd -T 2>/dev/null | awk '$1=="usepam"{print $2}')" == yes ]] || fail control - "SSH no usa PAM (UsePAM) o no se pudo comprobar con sshd -T"
+  command -v ssh >/dev/null && command -v ssh-keygen >/dev/null || fail control - "falta el cliente ssh para la verificación"
+  getent passwd "$VERIFY_USER" >/dev/null && fail control - "ya existe la cuenta $VERIFY_USER (de una verificación anterior); eliminala antes"
+  if ! getent group "$GROUP" >/dev/null; then
+    groupadd --system "$GROUP" || fail control - "no se pudo crear el grupo $GROUP"
+  fi
+  install -d -m 0700 "$STATE_DIR"
+  write_limit_hook || fail control - "no se pudo escribir $LIMIT_HOOK"
+  cp -p -- "$PAM_SSHD" "$PAM_BACKUP" && chmod 0600 "$PAM_BACKUP" || fail control - "no se pudo copiar $PAM_SSHD"
+  if ! pam_lines add || ! control_active; then
+    cp -p -- "$PAM_BACKUP" "$PAM_SSHD"
+    rm -f -- "$LIMIT_HOOK"
+    fail control - "no se pudo modificar $PAM_SSHD; quedó como estaba"
+  fi
+  register_open_sessions
+  echo "Verificando con una cuenta temporal ($VERIFY_USER, límite 1)..."
+  if ! verify_limit; then
+    pam_lines remove || cp -p -- "$PAM_BACKUP" "$PAM_SSHD"
+    rm -f -- "$LIMIT_HOOK"
+    rm -rf -- "$SESSIONS_DIR"
+    fail control - "verificación fallida: $VERIFY_ERR. Se revirtió: $PAM_SSHD quedó como antes"
+  fi
+  log "accion=control valor=on resultado=ok copia=$PAM_BACKUP"
+  echo "Verificación correcta: la 2.ª conexión fue rechazada y la 1.ª siguió abierta."
+  echo "Copia de $PAM_SSHD anterior: $PAM_BACKUP. SSH no se reinició."
+  control_show
+}
+
+control_off() {
+  if ! control_active && ! grep -qF -e "$PAM_LINE1" -e "$LIMIT_HOOK" "$PAM_SSHD" 2>/dev/null; then
+    rm -f -- "$LIMIT_HOOK"
+    control_show
+    return 0
+  fi
+  # Primero las líneas y después el script: sin el script, las cuentas del grupo no entrarían.
+  pam_lines remove || fail control - "no se pudo modificar $PAM_SSHD"
+  grep -qF -e "$PAM_LINE1" -e "$LIMIT_HOOK" "$PAM_SSHD" && fail control - "quedaron líneas del control en $PAM_SSHD"
+  rm -f -- "$LIMIT_HOOK"
+  rm -rf -- "$SESSIONS_DIR"
+  log "accion=control valor=off resultado=ok"
+  if [[ -r "$PAM_BACKUP" ]] && cmp -s "$PAM_BACKUP" "$PAM_SSHD"; then
+    echo "$PAM_SSHD quedó igual que antes de activar el control."
+  fi
+  echo "Ninguna conexión abierta se cerró. SSH no se reinició."
+  control_show
+}
+
 main() {
   local action="${1:-}"
   case "$action" in
@@ -422,6 +636,7 @@ main() {
     crear) (($# >= 2 && $# <= 4)) || { usage; exit 1; } ;;
     limite) (($# == 2 || $# == 3)) || { usage; exit 1; } ;;
     renovar|vencimiento) (($# == 3)) || { usage; exit 1; } ;;
+    control) (($# == 1)) || [[ $# == 2 && "$2" =~ ^(on|off)$ ]] || { usage; exit 1; } ;;
     -h|--help|ayuda) usage; exit 0 ;;
     *) usage; exit 1 ;;
   esac
@@ -439,6 +654,12 @@ main() {
     suspender) cmd_suspender "$2" ;;
     reactivar) cmd_reactivar "$2" ;;
     eliminar) cmd_eliminar "$2" ;;
+    control)
+      case "${2:-}" in
+        on) control_on ;;
+        off) control_off ;;
+        *) control_show ;;
+      esac ;;
   esac
 }
 

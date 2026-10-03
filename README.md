@@ -140,6 +140,7 @@ sudo vpsarg-usuarios limite USUARIO [N]   # muestra o cambia el máximo de conex
 sudo vpsarg-usuarios suspender USUARIO
 sudo vpsarg-usuarios reactivar USUARIO
 sudo vpsarg-usuarios eliminar USUARIO
+sudo vpsarg-usuarios control [on|off]     # aplica los límites con PAM (sin argumento: estado)
 ```
 
 | Acción | Qué hace |
@@ -148,13 +149,27 @@ sudo vpsarg-usuarios eliminar USUARIO
 | Renovar | Suma DÍAS desde hoy o desde el vencimiento actual, el que sea mayor. Si está suspendida, actualiza el vencimiento guardado y sigue suspendida |
 | Vencimiento | Pone una fecha exacta (posterior a hoy) o `nunca` |
 | Cambiar contraseña | `chpasswd` por la entrada estándar. Las sesiones abiertas siguen |
-| Límite | Guarda el máximo de conexiones en `/etc/vpsarg/limites` (0600). **Todavía no se aplica**: cambiarlo no cierra ninguna sesión |
+| Límite | Guarda el máximo de conexiones en `/etc/vpsarg/limites` (0600). Se aplica solo con el control de límites activo. Cambiarlo no cierra ninguna sesión |
 | Suspender | Guarda el vencimiento actual en `/etc/vpsarg/usuarios-suspendidos` (0600), aplica `chage -E 0` y cierra las sesiones SSH abiertas con SIGTERM. La contraseña no se toca |
 | Reactivar | Restaura el vencimiento guardado con `chage -E` (o sin vencimiento si no había) y borra la línea guardada |
 | Eliminar | Cierra las sesiones con SIGTERM, espera a que no quede ningún proceso de la cuenta (si solo queda su `systemd --user`, detiene `user@UID.service` de esa cuenta) y ejecuta `userdel -r` |
 | Listar / ver | Estado (ACTIVO, SUSPENDIDO, VENCIDO, CONTRASEÑA BLOQUEADA), límite, sesiones SSH abiertas y vencimiento. Nunca muestra contraseñas |
 
 **Vencimiento**: desde el día indicado (inclusive) la cuenta no puede iniciar sesiones nuevas; las que ya están abiertas siguen hasta que se desconectan.
+
+### Límite de conexiones (control con PAM)
+
+Se activa a mano con `sudo vpsarg-usuarios control on` o desde **Configuración › Límite de conexiones por usuario**. El instalador no lo activa.
+
+- Una **conexión** es una sesión SSH autenticada, llegue por SSH directo, PDirect-C o HCR. Si la cuenta ya tiene tantas como su límite, la conexión nueva se **rechaza** después de validar la contraseña. Las conexiones abiertas **nunca se cierran**, ni al rechazar ni al bajar el límite.
+- Activar agrega 3 líneas (un comentario y 2 `account`) después de `@include common-account` en `/etc/pam.d/sshd`, con copia previa en `/etc/vpsarg/pam-sshd.antes-del-limite`, y escribe `/usr/local/sbin/vpsarg-limite`. **No reinicia SSH**: PAM se lee en cada conexión nueva.
+- Solo se aplica a las cuentas del grupo `vpsarg-usuarios`: root y los administradores no pasan por el control.
+- Al activar se verifica con una cuenta temporal (`vpsarg-verif`, límite 1, clave pública a 127.0.0.1): la 2.ª conexión tiene que ser rechazada y la 1.ª seguir. Si falla, se revierte solo y la cuenta temporal se borra. Requiere `UsePAM yes`.
+- Las conexiones que ya estaban abiertas al activarlo cuentan para el límite.
+- Cada conexión aceptada se registra en `/run/vpsarg/sesiones/USUARIO/` (se vacía al reiniciar el servidor, cuando ya no hay conexiones). Aceptadas y rechazadas quedan en `journalctl -t vpsarg-limite`.
+- El cliente OpenSSH muestra `CONEXION RECHAZADA: limite de conexiones alcanzado (N/N)`; una app de túnel puede mostrar solo que la conexión se cerró.
+- **PDirect-C y reconexiones**: PDirect-C no detecta enseguida que el cliente se fue. Si el cliente desaparece sin cerrar la sesión SSH (app cerrada a la fuerza, corte de red), la conexión hacia SSH sigue hasta la espera de 60 s sin datos de PDirect-C y cuenta para el límite: con límite 1, una reconexión inmediata por el puerto 80 se rechaza durante ~60 s. Medido igual en Ubuntu 20.04, 22.04 y 24.04. Si el cliente cierra la sesión SSH ordenadamente, en general se libera enseguida, pero en el laboratorio también tardó ~60 s en 2 de 3 intentos en 20.04 y en 1 de 3 en 22.04. Por SSH directo se libera enseguida.
+- Desactivar (`control off`) quita primero las líneas de `/etc/pam.d/sshd` y después el script. Si `/usr/local/sbin/vpsarg-limite` se borra a mano con el control activo, las cuentas del grupo no pueden entrar (los administradores sí).
 
 - Solo administra cuentas del grupo `vpsarg-usuarios` con UID 1000 o mayor. No toca `root` ni otras cuentas del servidor.
 - Nombres: minúsculas, números, `_` o `-`, empiezan con letra o `_`, hasta 31 caracteres. Contraseñas: 6 a 128 caracteres, sin `:`.

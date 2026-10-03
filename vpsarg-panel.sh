@@ -741,6 +741,32 @@ menu_auto() {
   pause
 }
 
+# ------------------------------------------------------------------ límite de conexiones
+limit_control_state() {
+  if [[ -x "$USUARIOS" ]] && "$USUARIOS" control 2>/dev/null | grep -q "^Control de límites: ACTIVO"; then echo ACTIVO; else echo INACTIVO; fi
+}
+
+menu_limite() {
+  banner
+  echo "${B}CONFIGURACIÓN › LÍMITE DE CONEXIONES${N}"; echo
+  [[ -x "$USUARIOS" ]] || { echo "No está instalado $USUARIOS."; pause; return; }
+  "$USUARIOS" control || true
+  echo
+  echo "Con el control ACTIVO, una conexión SSH nueva de una cuenta de usuario se rechaza si ya"
+  echo "tiene abiertas tantas conexiones como su límite. Las conexiones abiertas nunca se cierran."
+  echo "No afecta a root ni a los administradores. Agrega 2 líneas a /etc/pam.d/sshd (con copia)"
+  echo "y no reinicia SSH. Al activarlo se verifica con una cuenta temporal y, si falla, se revierte."
+  echo "Una conexión que entró por PDirect-C sigue contando hasta ~60 s después de que el cliente"
+  echo "se desconecta: con límite 1, reconectar enseguida por el puerto 80 se rechaza en ese lapso."
+  echo
+  if [[ "$(limit_control_state)" == ACTIVO ]]; then
+    confirm "¿Desactivar el control de límites?" && run_logged "accion=control-limite valor=off" "$USUARIOS" control off
+  else
+    confirm "¿Activar el control de límites?" && run_logged "accion=control-limite valor=on" "$USUARIOS" control on
+  fi
+  pause
+}
+
 # ------------------------------------------------------------------ configuración
 menu_configuracion() {
   local p
@@ -754,6 +780,7 @@ menu_configuracion() {
     echo "  4) Registro del panel"
     echo "  5) Guardar copia de la configuración   6) Ver copias guardadas"
     echo "  7) Auto inicio ($(show_auto 2>/dev/null | sed 's/ para .*//' || echo 'AUTO: no disponible'))"
+    echo "  8) Límite de conexiones por usuario ($(limit_control_state))"
     echo "  0) Volver"
     echo "El puerto 80 de PDirect-C, el 7300 de UDPGW y el puerto de sshd no se cambian desde el panel."
     ask "Opción: "
@@ -781,6 +808,7 @@ menu_configuracion() {
       5) make_backup; pause ;;
       6) ls -1 "$BACKUP_ROOT" 2>/dev/null || echo "No hay copias."; pause ;;
       7) menu_auto ;;
+      8) menu_limite ;;
       0|"") return ;;
       *) echo "Opción inválida."; sleep 1 ;;
     esac
