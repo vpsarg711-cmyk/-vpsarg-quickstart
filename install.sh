@@ -20,6 +20,7 @@ UDPGW_UNIT="udpgw-7300.service"
 CONTROLLER="/usr/local/sbin/vpsarg-puertos"
 HCR_CONTROLLER="/usr/local/sbin/vpsarg-hcr"
 PANEL="/usr/local/sbin/vpsarg"
+USERS_CONTROLLER="/usr/local/sbin/vpsarg-usuarios"
 HCR_CONF="/etc/vpsarg-hcr.conf"
 SERVICES_CONF="/etc/vpsarg-servicios.conf"
 VALIDATED_UBUNTU="20.04 22.04 24.04"
@@ -163,6 +164,8 @@ fetch vpsarg-hcr.sh "$WORKDIR/vpsarg-hcr.sh"
 bash -n "$WORKDIR/vpsarg-hcr.sh" || fail "El controlador de HCR descargado tiene errores de sintaxis."
 fetch vpsarg-panel.sh "$WORKDIR/vpsarg-panel.sh"
 bash -n "$WORKDIR/vpsarg-panel.sh" || fail "El panel descargado tiene errores de sintaxis."
+fetch vpsarg-usuarios.sh "$WORKDIR/vpsarg-usuarios.sh"
+bash -n "$WORKDIR/vpsarg-usuarios.sh" || fail "El controlador de usuarios descargado tiene errores de sintaxis."
 
 echo "[3/6] Compilando PDirect-C..."
 gcc -O2 -Wall -Wextra -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
@@ -191,6 +194,7 @@ install -o root -g root -m 0755 "$WORKDIR/vpsarg-puertos.sh" "$CONTROLLER"
 # Solo se copia el controlador: HCR se instala aparte con "sudo vpsarg-hcr instalar".
 install -o root -g root -m 0755 "$WORKDIR/vpsarg-hcr.sh" "$HCR_CONTROLLER"
 install -o root -g root -m 0755 "$WORKDIR/vpsarg-panel.sh" "$PANEL"
+install -o root -g root -m 0755 "$WORKDIR/vpsarg-usuarios.sh" "$USERS_CONTROLLER"
 
 printf 'SSH_PORT=%s\n' "$SSH_PORT" > "$PDIRECT_CONF"
 # Se conservan otros servicios ya registrados (por ejemplo hcr-8880).

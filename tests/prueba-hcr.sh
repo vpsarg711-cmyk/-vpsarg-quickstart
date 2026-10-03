@@ -110,14 +110,20 @@ chmod 0755 "$BIN"
 systemctl restart hcr-8880
 sleep 1
 check "puerto-ssh 2222 falla porque HCR no arranca" bash -c '! vpsarg-puertos puerto-ssh 2222 >/tmp/rollback.log 2>&1'
-# La reversión reinicia pdirect-80 sin esperar al exec: se espera hasta 5 s.
-pd_back() { for _ in 1 2 3 4 5 6 7 8 9 10; do [[ "$(pd_port 2>/dev/null)" == 22 ]] && return 0; sleep 0.5; done; return 1; }
-check "PDirect-C volvió a 22" pd_back
+check "la reversión informa que quedó verificada" grep -q "Reversión verificada: PDirect-C activo, escucha en TCP 80, apunta a 127.0.0.1:22 y llega a SSH" /tmp/rollback.log
+# Sin espera: puerto-ssh ya no termina hasta verificar la reversión.
+check "PDirect-C volvió a 22 (inmediatamente)" test "$(pd_port)" = 22
 check "configuración de PDirect-C en 22" grep -qx SSH_PORT=22 /etc/vpsarg-pdirect.conf
 check "HCR volvió a 22" test "$(conf HCR_SSH_PORT)" = 22
 sleep 1
 check "HCR activo tras la reversión" systemctl is-active --quiet hcr-8880
 check "PDirect-C llega a SSH tras la reversión" pdirect_ssh
+systemctl stop pdirect-80
+check "con PDirect-C detenido: puerto-ssh 2222 falla y revierte" bash -c '! vpsarg-puertos puerto-ssh 2222 >/tmp/rollback2.log 2>&1'
+check "informa la reversión con PDirect-C detenido" grep -q "Reversión verificada: /etc/vpsarg-pdirect.conf vuelve a 22 (PDirect-C estaba detenido)" /tmp/rollback2.log
+check "PDirect-C sigue detenido y su configuración en 22" bash -c '! systemctl is-active --quiet pdirect-80 && grep -qx SSH_PORT=22 /etc/vpsarg-pdirect.conf'
+systemctl start pdirect-80
+sleep 1
 mv -f "$BIN.real" "$BIN"
 systemctl restart hcr-8880
 sleep 1

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pruebas de laboratorio del panel vpsarg (Fase 2B).
+# Pruebas de laboratorio del panel vpsarg (Fase 2B; los usuarios están en prueba-usuarios.sh).
 # SOLO para una máquina o contenedor de laboratorio con QuickStart instalado y HCR
 # sin instalar: inicia un sshd extra en 127.0.0.1:2222, instala y desinstala HCR
 # y maneja el menú enviándole respuestas por la entrada estándar.
@@ -63,7 +63,8 @@ check "recursos: muestra PDirect-C y UDPGW con su PID" \
 check "ssh: informa PasswordAuthentication según sshd -T" \
   bash -c 'pa="$(sshd -T | awk '"'"'$1=="passwordauthentication"{print $2}'"'"')"; vpsarg ssh | grep -q "PasswordAuthentication $pa"'
 panel "3\n\n6\n\n0\n"
-check "Usuarios SSH y Ancho de banda figuran como pendientes" bash -c '[[ $(grep -c "^Pendiente" '"$OUT"') == 2 ]]'
+check "Ancho de banda figura como pendiente" bash -c '[[ $(grep -c "^Pendiente: la medición de tráfico" '"$OUT"') == 1 ]]'
+check "Usuarios SSH abre el listado de cuentas" grep -q "^USUARIO *UID *ESTADO" "$OUT"
 check "el menú termina al cerrarse la entrada" bash -c 'printf "" | timeout 10 vpsarg >/dev/null 2>&1'
 
 echo "### Entradas inválidas"

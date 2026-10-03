@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # VPS ARG QuickStart - panel de administración (terminal)
 # Es un script interactivo: no deja ningún proceso en segundo plano.
-# Todas las acciones pasan por vpsarg-puertos y vpsarg-hcr, que validan y revierten.
+# Todas las acciones pasan por vpsarg-puertos, vpsarg-hcr y vpsarg-usuarios, que validan y revierten.
 # No modifica sshd ni /etc/ssh/sshd_config, el firewall, el código, los argumentos
 # ni el puerto de PDirect-C, ni la configuración o los límites de UDPGW.
 set -Euo pipefail
@@ -11,6 +11,7 @@ PDIRECT_CONF="/etc/vpsarg-pdirect.conf"
 HCR_CONF="/etc/vpsarg-hcr.conf"
 PUERTOS="/usr/local/sbin/vpsarg-puertos"
 HCR="/usr/local/sbin/vpsarg-hcr"
+USUARIOS="/usr/local/sbin/vpsarg-usuarios"
 BACKUP_ROOT="/var/backups/vpsarg"
 LOG_TAG="vpsarg-panel"
 KNOWN_UNITS=(pdirect-80 udpgw-7300 hcr-8880)
@@ -32,6 +33,7 @@ Uso:
   sudo vpsarg conexiones      conexiones TCP establecidas por servicio
   sudo vpsarg recursos        memoria, CPU y descriptores de cada servicio
   sudo vpsarg ssh             autenticación de SSH (solo lectura)
+  sudo vpsarg usuarios        cuentas SSH de los usuarios
 EOF
 }
 
@@ -55,6 +57,10 @@ ask() {
 confirm() {
   ask "$1 [s/N]: "
   [[ "$REPLY" =~ ^[sS]$ ]]
+}
+
+valid_user() {
+  [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]]
 }
 
 valid_port() {
@@ -376,6 +382,43 @@ menu_hcr() {
   done
 }
 
+menu_usuarios() {
+  local u
+  [[ -x "$USUARIOS" ]] || { pending "USUARIOS SSH" "No está instalado $USUARIOS."; return; }
+  while true; do
+    banner
+    echo "${B}USUARIOS SSH${N}"; echo
+    if [[ "$(sshd -T 2>/dev/null | awk '$1=="passwordauthentication"{print $2}')" != yes ]]; then
+      echo "${Y}AVISO: SSH no acepta contraseñas o no se pudo comprobar (ver Diagnóstico > Autenticación de SSH).${N}"
+      echo
+    fi
+    "$USUARIOS" listar 2>&1 || true
+    echo
+    echo "  1) Crear   2) Ver   3) Suspender   4) Reactivar   5) Eliminar   0) Volver"
+    ask "Opción: "
+    case "$REPLY" in
+      1|2|3|4|5)
+        local opt="$REPLY"
+        ask "Usuario: "
+        valid_user "$REPLY" || { echo "Nombre no válido (minúsculas, números, _ o -; máximo 31)."; pause; continue; }
+        u="$REPLY"
+        case "$opt" in
+          1) echo "La contraseña no se muestra mientras la escribís (mínimo 6 caracteres)."
+             "$USUARIOS" crear "$u" || true ;;
+          2) "$USUARIOS" ver "$u" || true ;;
+          3) confirm "¿Suspender $u? Se cierran sus sesiones SSH abiertas." && { "$USUARIOS" suspender "$u" || true; } ;;
+          4) "$USUARIOS" reactivar "$u" || true ;;
+          5) ask "Para eliminar $u y su directorio personal, escribí el nombre otra vez: "
+             if [[ "$REPLY" == "$u" ]]; then "$USUARIOS" eliminar "$u" || true; else echo "No coincide. No se eliminó."; fi ;;
+        esac
+        pause
+        ;;
+      0|"") return ;;
+      *) echo "Opción inválida."; sleep 1 ;;
+    esac
+  done
+}
+
 make_backup() {
   local dir f files=()
   dir="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)-panel"
@@ -433,7 +476,7 @@ main_menu() {
     case "$REPLY" in
       1) menu_servicios ;;
       2) menu_puertos ;;
-      3) pending "USUARIOS SSH" "Pendiente: la gestión de cuentas SSH todavía no está habilitada." ;;
+      3) menu_usuarios ;;
       4) menu_hcr ;;
       5) menu_diagnostico ;;
       6) pending "ANCHO DE BANDA" "Pendiente: la medición de tráfico todavía no está habilitada." ;;
@@ -452,6 +495,7 @@ main() {
     conexiones) show_conexiones ;;
     recursos) show_recursos ;;
     ssh) show_ssh ;;
+    usuarios) "$USUARIOS" listar ;;
     -h|--help|ayuda) usage ;;
     *) usage; exit 1 ;;
   esac

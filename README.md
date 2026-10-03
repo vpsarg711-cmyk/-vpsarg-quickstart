@@ -41,7 +41,7 @@ El instalador:
 2. Si detecta una instalación previa, la lista y solo continúa si escribís `SI`.
 3. Pregunta el puerto SSH local (Enter = 22, o el valor de una instalación previa) y comprueba que haya algo escuchando en `127.0.0.1:PUERTO`. Si no lo hay, avisa y pide confirmación.
 4. Instala dependencias: `ca-certificates curl git cmake make gcc libc6-dev libevent-dev`.
-5. Descarga `pdirect.c`, `vpsarg-puertos.sh`, `vpsarg-hcr.sh` y `vpsarg-panel.sh` de la rama `main` y compila PDirect-C:
+5. Descarga `pdirect.c`, `vpsarg-puertos.sh`, `vpsarg-hcr.sh`, `vpsarg-panel.sh` y `vpsarg-usuarios.sh` de la rama `main` y compila PDirect-C:
    `gcc -O2 -Wall -Wextra -D_FORTIFY_SOURCE=2 -fstack-protector-strong -o pdirect-c pdirect.c -levent_core`
 6. Clona BadVPN (`github.com/ambrop72/badvpn`) y compila solo UDPGW con CMake.
 7. Instala los archivos, crea las unidades systemd, las habilita y comprueba que ambos servicios estén activos y escuchando.
@@ -57,6 +57,7 @@ Si cualquier paso crítico falla, se detiene con un mensaje de error. Hasta el p
 | `/usr/local/sbin/vpsarg-puertos` | Controlador |
 | `/usr/local/sbin/vpsarg-hcr` | Controlador de HCR (no instala HCR por sí solo) |
 | `/usr/local/sbin/vpsarg` | Panel de administración |
+| `/usr/local/sbin/vpsarg-usuarios` | Cuentas SSH de los usuarios |
 | `/etc/vpsarg-pdirect.conf` | `SSH_PORT=22` — única fuente del puerto SSH de destino |
 | `/etc/vpsarg-servicios.conf` | Servicios que maneja el controlador |
 | `/etc/systemd/system/pdirect-80.service` | Unidad de PDirect-C |
@@ -86,15 +87,43 @@ sudo vpsarg puertos      # puerto de sshd, destino de PDirect-C y HCR, puertos e
 sudo vpsarg conexiones   # conexiones TCP establecidas por puerto
 sudo vpsarg recursos     # RAM, CPU, hilos y descriptores por servicio, RAM y disco del servidor
 sudo vpsarg ssh          # si sshd acepta contraseñas (solo lectura)
+sudo vpsarg usuarios     # cuentas SSH de los usuarios
 ```
 
-El menú tiene secciones separadas: Servicios, Puertos, Usuarios SSH, HCR, Diagnóstico y recursos, y Ancho de banda. Usuarios SSH y Ancho de banda todavía no tienen funciones.
+El menú tiene secciones separadas: Servicios, Puertos, Usuarios SSH, HCR, Diagnóstico y recursos, y Ancho de banda. Ancho de banda todavía no tiene funciones.
 
 - Es un script: no queda ningún proceso corriendo después de salir.
-- Todas las acciones usan `vpsarg-puertos` y `vpsarg-hcr`; las que cambian algo piden confirmación y quedan registradas (`journalctl -t vpsarg-panel`).
+- Todas las acciones usan `vpsarg-puertos`, `vpsarg-hcr` y `vpsarg-usuarios`; las que cambian algo piden confirmación y quedan registradas (`journalctl -t vpsarg-panel`).
 - No modifica `/etc/ssh/sshd_config`, el puerto de sshd, el firewall, el puerto 80 ni los argumentos de PDirect-C, ni la configuración o los límites de UDPGW.
 - Los números de conexiones son **conexiones TCP**, no usuarios. Todo lo que entra por PDirect-C o HCR llega a SSH desde 127.0.0.1.
 - "Guardar copia de la configuración" copia `/etc/vpsarg-*.conf` y las unidades a `/var/backups/vpsarg/FECHA-panel/`.
+
+## Usuarios SSH
+
+Los usuarios finales son cuentas Linux normales y entran con **usuario y contraseña SSH**. No hay tokens, HWID ni otra autenticación.
+
+```bash
+sudo vpsarg-usuarios listar
+sudo vpsarg-usuarios ver USUARIO
+sudo vpsarg-usuarios crear USUARIO        # pide la contraseña dos veces, sin mostrarla
+sudo vpsarg-usuarios suspender USUARIO
+sudo vpsarg-usuarios reactivar USUARIO
+sudo vpsarg-usuarios eliminar USUARIO
+```
+
+| Acción | Qué hace |
+|---|---|
+| Crear | `useradd -m -k /dev/null -s /usr/sbin/nologin -G vpsarg-usuarios USUARIO` y la contraseña por la entrada estándar de `chpasswd`. Sin shell: sirve para túneles (`ssh -N`), no para entrar a una consola |
+| Suspender | Guarda el vencimiento actual en `/etc/vpsarg/usuarios-suspendidos` (0600), aplica `chage -E 0` y cierra las sesiones SSH abiertas con SIGTERM. La contraseña no se toca |
+| Reactivar | Restaura el vencimiento guardado con `chage -E` (o sin vencimiento si no había) y borra la línea guardada |
+| Eliminar | Cierra las sesiones con SIGTERM y ejecuta `userdel -r` |
+| Listar / ver | Estado (ACTIVO, SUSPENDIDO, VENCIDO, CONTRASEÑA BLOQUEADA), sesiones SSH abiertas y vencimiento. Nunca muestra contraseñas |
+
+- Solo administra cuentas del grupo `vpsarg-usuarios` con UID 1000 o mayor. No toca `root` ni otras cuentas del servidor.
+- Nombres: minúsculas, números, `_` o `-`, empiezan con letra o `_`, hasta 31 caracteres. Contraseñas: 6 a 128 caracteres, sin `:`.
+- No usa `usermod -L`: no impide entrar con clave pública. No modifica `/etc/ssh/sshd_config` ni `/etc/shells`.
+- Si sshd tiene `PasswordAuthentication no`, `crear` y el panel lo avisan, pero no lo cambian.
+- Cada operación queda en `journalctl -t vpsarg-panel` con el resultado; nunca la contraseña.
 
 ## Puerto SSH de destino
 
@@ -110,7 +139,7 @@ El cambio:
 - Valida el número (1-65535) y comprueba que en `127.0.0.1:PUERTO` responda un servidor SSH; si no, avisa y pide confirmación.
 - Escribe `SSH_PORT=PUERTO` en `/etc/vpsarg-pdirect.conf`, reinicia solo `pdirect-80` y comprueba que el proceso use el puerto nuevo y que una conexión por TCP 80 llegue a SSH.
 - Si HCR está instalado, actualiza `HCR_SSH_PORT` en `/etc/vpsarg-hcr.conf` y reinicia solo `hcr-8880`.
-- Si algo falla, restaura el valor anterior en PDirect-C y en HCR.
+- Si algo falla, restaura el valor anterior en PDirect-C y en HCR, y verifica que PDirect-C quedó activo, escuchando en TCP 80, apuntando al puerto anterior y llegando a SSH.
 - No modifica sshd, el puerto 80, UDPGW ni el firewall.
 
 **Importante:** este comando no cambia el puerto en el que escucha SSH. Si cambiás el puerto de sshd por tu cuenta, después ejecutá `puerto-ssh` con el puerto nuevo.
@@ -194,6 +223,8 @@ printf 'GET / HTTP/1.1\r\nHost: x\r\n\r\n' | timeout 3 nc 127.0.0.1 80
 
 Si instalaste HCR, quitalo primero (no toca PDirect-C ni UDPGW y conserva `/opt/hcr`): `sudo vpsarg-hcr desinstalar`.
 
+Las cuentas de usuarios no se borran solas: si querés quitarlas, usá `sudo vpsarg-usuarios eliminar USUARIO` antes. `/etc/vpsarg/` guarda los vencimientos de las cuentas suspendidas.
+
 El resto no toca SSH ni el firewall:
 
 ```bash
@@ -201,7 +232,7 @@ sudo systemctl disable --now pdirect-80 udpgw-7300
 sudo rm -f /etc/systemd/system/pdirect-80.service /etc/systemd/system/udpgw-7300.service
 sudo systemctl daemon-reload
 sudo rm -f /usr/local/bin/pdirect-c /opt/badvpn/badvpn-udpgw /usr/local/sbin/vpsarg-puertos \
-           /usr/local/sbin/vpsarg-hcr /usr/local/sbin/vpsarg /etc/vpsarg-pdirect.conf /etc/vpsarg-servicios.conf
+           /usr/local/sbin/vpsarg-hcr /usr/local/sbin/vpsarg /usr/local/sbin/vpsarg-usuarios /etc/vpsarg-pdirect.conf /etc/vpsarg-servicios.conf
 sudo rmdir /opt/badvpn
 ```
 

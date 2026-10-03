@@ -178,12 +178,45 @@ write_pdirect_conf() {
   mv -f "$tmp" "$PDIRECT_CONF"
 }
 
-# Vuelve PDirect-C al puerto anterior después de un fallo.
+# Vuelve PDirect-C al puerto anterior después de un fallo y verifica el resultado.
 rollback_pdirect() {
-  local old="$1" was_active="$2"
+  local old="$1" was_active="$2" pid problem="" _
   write_pdirect_conf "$old"
   if ((was_active)); then
     systemctl restart "$PDIRECT_SERVICE" || true
+    # Espera hasta 10 s a que systemd y PDirect-C terminen de arrancar.
+    for _ in $(seq 20); do
+      problem=""
+      pid="$(systemctl show -p MainPID --value "$PDIRECT_SERVICE")"
+      if ! systemctl is-active --quiet "$PDIRECT_SERVICE"; then
+        problem="el servicio no está activo"
+      elif [[ "$(pdirect_running_port)" != "$old" ]]; then
+        problem="el proceso no usa el puerto $old"
+      elif ! ss -Hltnp "sport = :80" 2>/dev/null | grep -q "pid=$pid,"; then
+        problem="no escucha en TCP 80"
+      elif ssh_banner "$old" && ! pdirect_reaches_ssh; then
+        problem="una conexión por TCP 80 no llega a SSH"
+      fi
+      [[ -z "$problem" ]] && break
+      sleep 0.5
+    done
+  fi
+  if [[ "$(ssh_port_current)" != "$old" ]]; then
+    problem="$PDIRECT_CONF no quedó en $old"
+  fi
+  if [[ -n "$problem" ]]; then
+    # Solo informa: quien llama termina con su propio mensaje de error.
+    echo "ATENCIÓN: la reversión de PDirect-C no se pudo verificar: $problem. Revisá: journalctl -u $PDIRECT_SERVICE -n 50" >&2
+    return 0
+  fi
+  if ((was_active)); then
+    if ssh_banner "$old"; then
+      echo "Reversión verificada: PDirect-C activo, escucha en TCP 80, apunta a 127.0.0.1:$old y llega a SSH." >&2
+    else
+      echo "Reversión verificada: PDirect-C activo, escucha en TCP 80 y apunta a 127.0.0.1:$old (SSH no responde en $old, no se pudo probar el flujo)." >&2
+    fi
+  else
+    echo "Reversión verificada: $PDIRECT_CONF vuelve a $old (PDirect-C estaba detenido)." >&2
   fi
 }
 
