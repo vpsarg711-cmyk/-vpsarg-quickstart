@@ -19,6 +19,7 @@ UDPGW_BIN="/opt/badvpn/badvpn-udpgw"
 UDPGW_UNIT="udpgw-7300.service"
 CONTROLLER="/usr/local/sbin/vpsarg-puertos"
 HCR_CONTROLLER="/usr/local/sbin/vpsarg-hcr"
+PANEL="/usr/local/sbin/vpsarg"
 HCR_CONF="/etc/vpsarg-hcr.conf"
 SERVICES_CONF="/etc/vpsarg-servicios.conf"
 VALIDATED_UBUNTU="20.04 22.04 24.04"
@@ -160,6 +161,8 @@ fetch vpsarg-puertos.sh "$WORKDIR/vpsarg-puertos.sh"
 bash -n "$WORKDIR/vpsarg-puertos.sh" || fail "El controlador descargado tiene errores de sintaxis."
 fetch vpsarg-hcr.sh "$WORKDIR/vpsarg-hcr.sh"
 bash -n "$WORKDIR/vpsarg-hcr.sh" || fail "El controlador de HCR descargado tiene errores de sintaxis."
+fetch vpsarg-panel.sh "$WORKDIR/vpsarg-panel.sh"
+bash -n "$WORKDIR/vpsarg-panel.sh" || fail "El panel descargado tiene errores de sintaxis."
 
 echo "[3/6] Compilando PDirect-C..."
 gcc -O2 -Wall -Wextra -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
@@ -187,6 +190,7 @@ install -o root -g root -m 0755 "$WORKDIR/badvpn/build/udpgw/badvpn-udpgw" "$UDP
 install -o root -g root -m 0755 "$WORKDIR/vpsarg-puertos.sh" "$CONTROLLER"
 # Solo se copia el controlador: HCR se instala aparte con "sudo vpsarg-hcr instalar".
 install -o root -g root -m 0755 "$WORKDIR/vpsarg-hcr.sh" "$HCR_CONTROLLER"
+install -o root -g root -m 0755 "$WORKDIR/vpsarg-panel.sh" "$PANEL"
 
 printf 'SSH_PORT=%s\n' "$SSH_PORT" > "$PDIRECT_CONF"
 # Se conservan otros servicios ya registrados (por ejemplo hcr-8880).
@@ -267,6 +271,7 @@ echo "======================================"
 echo "Instalación finalizada."
 echo "PDirect-C:   TCP 80 -> 127.0.0.1:$SSH_PORT ($PDIRECT_UNIT)"
 echo "BadVPN:      TCP 7300 ($UDPGW_UNIT)"
+echo "Panel: sudo vpsarg"
 echo "Controlador: sudo vpsarg-puertos estado"
 echo "Cambiar puerto SSH de destino: sudo vpsarg-puertos puerto-ssh PUERTO"
 echo

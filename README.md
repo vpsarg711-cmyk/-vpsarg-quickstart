@@ -8,7 +8,7 @@ Instalador para Ubuntu que compila e instala dos servicios ligeros, cada uno con
 | BadVPN UDPGW | `udpgw-7300.service` | `0.0.0.0:7300/TCP` | — |
 | HCR (opcional, se instala aparte) | `hcr-8880.service` | `:8880/TCP` (configurable) | SSH local `127.0.0.1:PUERTO_SSH` |
 
-Incluye el controlador `vpsarg-puertos` para consultar estado, iniciar, detener, reiniciar, habilitar, deshabilitar y cambiar el puerto SSH de destino, y `vpsarg-hcr` para instalar y administrar HCR (ver [HCR](#hcr-opcional)).
+Incluye el controlador `vpsarg-puertos` para consultar estado, iniciar, detener, reiniciar, habilitar, deshabilitar y cambiar el puerto SSH de destino, `vpsarg-hcr` para instalar y administrar HCR (ver [HCR](#hcr-opcional)), y el panel `vpsarg` (ver [Panel](#panel)).
 
 No instala panel web ni base de datos. **No modifica `sshd_config`, no reinicia SSH y no toca el firewall.**
 
@@ -41,7 +41,7 @@ El instalador:
 2. Si detecta una instalación previa, la lista y solo continúa si escribís `SI`.
 3. Pregunta el puerto SSH local (Enter = 22, o el valor de una instalación previa) y comprueba que haya algo escuchando en `127.0.0.1:PUERTO`. Si no lo hay, avisa y pide confirmación.
 4. Instala dependencias: `ca-certificates curl git cmake make gcc libc6-dev libevent-dev`.
-5. Descarga `pdirect.c`, `vpsarg-puertos.sh` y `vpsarg-hcr.sh` de la rama `main` y compila PDirect-C:
+5. Descarga `pdirect.c`, `vpsarg-puertos.sh`, `vpsarg-hcr.sh` y `vpsarg-panel.sh` de la rama `main` y compila PDirect-C:
    `gcc -O2 -Wall -Wextra -D_FORTIFY_SOURCE=2 -fstack-protector-strong -o pdirect-c pdirect.c -levent_core`
 6. Clona BadVPN (`github.com/ambrop72/badvpn`) y compila solo UDPGW con CMake.
 7. Instala los archivos, crea las unidades systemd, las habilita y comprueba que ambos servicios estén activos y escuchando.
@@ -56,6 +56,7 @@ Si cualquier paso crítico falla, se detiene con un mensaje de error. Hasta el p
 | `/opt/badvpn/badvpn-udpgw` | BadVPN UDPGW compilado |
 | `/usr/local/sbin/vpsarg-puertos` | Controlador |
 | `/usr/local/sbin/vpsarg-hcr` | Controlador de HCR (no instala HCR por sí solo) |
+| `/usr/local/sbin/vpsarg` | Panel de administración |
 | `/etc/vpsarg-pdirect.conf` | `SSH_PORT=22` — única fuente del puerto SSH de destino |
 | `/etc/vpsarg-servicios.conf` | Servicios que maneja el controlador |
 | `/etc/systemd/system/pdirect-80.service` | Unidad de PDirect-C |
@@ -75,6 +76,25 @@ sudo vpsarg-puertos deshabilitar           # detener + quitar arranque automáti
 sudo vpsarg-puertos reiniciar pdirect-80   # cualquier acción sobre un solo servicio
 sudo vpsarg-puertos detener udpgw-7300
 ```
+
+## Panel
+
+```bash
+sudo vpsarg              # menú
+sudo vpsarg estado       # ACTIVO / DETENIDO / ERROR / NO INSTALADO por servicio
+sudo vpsarg puertos      # puerto de sshd, destino de PDirect-C y HCR, puertos en escucha
+sudo vpsarg conexiones   # conexiones TCP establecidas por puerto
+sudo vpsarg recursos     # RAM, CPU, hilos y descriptores por servicio, RAM y disco del servidor
+sudo vpsarg ssh          # si sshd acepta contraseñas (solo lectura)
+```
+
+El menú tiene secciones separadas: Servicios, Puertos, Usuarios SSH, HCR, Diagnóstico y recursos, y Ancho de banda. Usuarios SSH y Ancho de banda todavía no tienen funciones.
+
+- Es un script: no queda ningún proceso corriendo después de salir.
+- Todas las acciones usan `vpsarg-puertos` y `vpsarg-hcr`; las que cambian algo piden confirmación y quedan registradas (`journalctl -t vpsarg-panel`).
+- No modifica `/etc/ssh/sshd_config`, el puerto de sshd, el firewall, el puerto 80 ni los argumentos de PDirect-C, ni la configuración o los límites de UDPGW.
+- Los números de conexiones son **conexiones TCP**, no usuarios. Todo lo que entra por PDirect-C o HCR llega a SSH desde 127.0.0.1.
+- "Guardar copia de la configuración" copia `/etc/vpsarg-*.conf` y las unidades a `/var/backups/vpsarg/FECHA-panel/`.
 
 ## Puerto SSH de destino
 
@@ -181,7 +201,7 @@ sudo systemctl disable --now pdirect-80 udpgw-7300
 sudo rm -f /etc/systemd/system/pdirect-80.service /etc/systemd/system/udpgw-7300.service
 sudo systemctl daemon-reload
 sudo rm -f /usr/local/bin/pdirect-c /opt/badvpn/badvpn-udpgw /usr/local/sbin/vpsarg-puertos \
-           /usr/local/sbin/vpsarg-hcr /etc/vpsarg-pdirect.conf /etc/vpsarg-servicios.conf
+           /usr/local/sbin/vpsarg-hcr /usr/local/sbin/vpsarg /etc/vpsarg-pdirect.conf /etc/vpsarg-servicios.conf
 sudo rmdir /opt/badvpn
 ```
 

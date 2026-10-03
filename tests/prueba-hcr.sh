@@ -76,7 +76,8 @@ check "rechaza 7300" bash -c '! vpsarg-hcr puerto 7300 >/dev/null 2>&1'
 check "rechaza 1000 (< 1024)" bash -c '! vpsarg-hcr puerto 1000 >/dev/null 2>&1'
 python3 -m http.server 8081 --bind 127.0.0.1 >/dev/null 2>&1 &
 WEB=$!
-sleep 1
+for _ in 1 2 3 4 5 6 7 8 9 10; do listening 8081 && break; sleep 0.5; done
+check "servidor web de prueba escucha en 8081" listening 8081
 check "rechaza 8081 ocupado por otro programa" bash -c '! vpsarg-hcr puerto 8081 >/dev/null 2>&1'
 check "no detuvo el programa del 8081" kill -0 "$WEB"
 kill "$WEB"
@@ -109,7 +110,9 @@ chmod 0755 "$BIN"
 systemctl restart hcr-8880
 sleep 1
 check "puerto-ssh 2222 falla porque HCR no arranca" bash -c '! vpsarg-puertos puerto-ssh 2222 >/tmp/rollback.log 2>&1'
-check "PDirect-C volvió a 22" test "$(pd_port)" = 22
+# La reversión reinicia pdirect-80 sin esperar al exec: se espera hasta 5 s.
+pd_back() { for _ in 1 2 3 4 5 6 7 8 9 10; do [[ "$(pd_port 2>/dev/null)" == 22 ]] && return 0; sleep 0.5; done; return 1; }
+check "PDirect-C volvió a 22" pd_back
 check "configuración de PDirect-C en 22" grep -qx SSH_PORT=22 /etc/vpsarg-pdirect.conf
 check "HCR volvió a 22" test "$(conf HCR_SSH_PORT)" = 22
 sleep 1
