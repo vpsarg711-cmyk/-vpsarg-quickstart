@@ -101,14 +101,23 @@ sudo vpsarg-puertos detener udpgw-7300
 ```bash
 sudo vpsarg              # menú
 sudo vpsarg estado       # ACTIVO / DETENIDO / ERROR / NO INSTALADO por servicio
+sudo vpsarg protocolos   # estado, puerto y PID de PDirect-C, UDPGW, HCR y SSH
+sudo vpsarg sistema      # CPU, RAM, swap, disco, uptime, protocolos y usuarios conectados
 sudo vpsarg puertos      # puerto de sshd, destino de PDirect-C y HCR, puertos en escucha
 sudo vpsarg conexiones   # conexiones TCP establecidas por puerto
 sudo vpsarg recursos     # RAM, CPU, hilos y descriptores por servicio, RAM y disco del servidor
 sudo vpsarg ssh          # si sshd acepta contraseñas (solo lectura)
 sudo vpsarg usuarios     # cuentas SSH de los usuarios
+sudo vpsarg auto on|off  # AUTO: abrir el panel al iniciar sesión con esta cuenta
 ```
 
-El menú tiene secciones separadas: Servicios, Puertos, Usuarios SSH, HCR, Diagnóstico y recursos, y Ancho de banda. Ancho de banda todavía no tiene funciones.
+El menú tiene cuatro secciones:
+- **Protocolos**: PDirect-C, UDPGW, HCR y SSH con estado, puerto y PID. Cada ficha permite iniciar, detener, reiniciar, habilitar o deshabilitar, y ver el registro y los errores recientes. HCR se instala y desinstala desde su ficha. **SSH es solo de lectura.**
+- **Usuarios**: cuentas SSH (ver [Usuarios SSH](#usuarios-ssh)).
+- **Estado**: CPU, carga, RAM, swap, disco, uptime, temperatura (si existe), protocolos y usuarios conectados. También muestra las conexiones TCP por servicio y los recursos de cada servicio.
+- **Configuración**: puerto SSH de destino, puerto de HCR, autenticación de SSH, registro del panel, copias y AUTO.
+
+**AUTO** (Configuración → Auto inicio o `sudo vpsarg auto on`): abre el panel al iniciar sesión en una terminal con la cuenta que lo activó. La lista de cuentas queda en `/etc/vpsarg-auto.conf` y el disparador en `/etc/profile.d/vpsarg-auto.sh`, que solo existe mientras haya alguna cuenta con AUTO. No se activa en `ssh host comando`, scp, sftp ni túneles, ni para las cuentas de `vpsarg-usuarios`. Con 0 o Ctrl+C se vuelve a la consola.
 
 - Es un script: no queda ningún proceso corriendo después de salir.
 - Todas las acciones usan `vpsarg-puertos`, `vpsarg-hcr` y `vpsarg-usuarios`; las que cambian algo piden confirmación y quedan registradas (`journalctl -t vpsarg-panel`).
