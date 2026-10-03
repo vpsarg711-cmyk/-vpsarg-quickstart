@@ -18,6 +18,9 @@ KNOWN_UNITS=(pdirect-80 udpgw-7300 hcr-8880)
 # Protocolos que muestra el panel. SSH es solo de lectura.
 PROTOCOLS=(pdirect-80 udpgw-7300 hcr-8880 ssh)
 USERS_GROUP="vpsarg-usuarios"
+# AUTO: cuentas que abren el panel al iniciar sesión y el disparador que lo hace.
+AUTO_CONF="/etc/vpsarg-auto.conf"
+AUTO_HOOK="/etc/profile.d/vpsarg-auto.sh"
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   B=$'\e[1m'; G=$'\e[32m'; R=$'\e[31m'; Y=$'\e[33m'; C=$'\e[36m'; N=$'\e[0m'
@@ -39,6 +42,7 @@ Uso:
   sudo vpsarg recursos        memoria, CPU y descriptores de cada servicio
   sudo vpsarg ssh             autenticación de SSH (solo lectura)
   sudo vpsarg usuarios        cuentas SSH de los usuarios
+  sudo vpsarg auto [on|off]   abrir el panel al iniciar sesión con esta cuenta (AUTO)
 EOF
 }
 
@@ -319,7 +323,9 @@ protocol_state() {
 }
 
 protocol_port() {
-  if [[ "$1" == ssh ]]; then ssh_listen_ports; else service_port "$1" 2>/dev/null || true; fi
+  local port
+  if [[ "$1" == ssh ]]; then port="$(ssh_listen_ports)"; else port="$(service_port "$1" 2>/dev/null || true)"; fi
+  echo "${port:--}"
 }
 
 protocol_pid() {
@@ -334,7 +340,7 @@ show_protocolos() {
   for p in "${PROTOCOLS[@]}"; do
     st="$(protocol_state "$p")"
     printf '%-12s %s%*s %-12s %s\n' "$(protocol_name "$p")" "$(paint_state "$st")" $((14 - ${#st})) "" \
-      "$(protocol_port "$p" | sed 's/^$/-/')" "$(protocol_pid "$p")"
+      "$(protocol_port "$p")" "$(protocol_pid "$p")"
   done
 }
 
@@ -361,7 +367,7 @@ show_unit_details() {
   fi
   echo "Instalado:   sí (unidad $unit)"
   echo "Estado:      $(paint_state "$st")"
-  echo "Puerto:      $(protocol_port "$unit" | sed 's/^$/-/')"
+  echo "Puerto:      $(protocol_port "$unit")"
   echo "PID:         $(protocol_pid "$unit")"
   echo "Arranque:    $(systemctl is-enabled "$unit" 2>/dev/null || echo desconocido)"
   echo "Activo desde: $(systemctl show -p ActiveEnterTimestamp --value "$unit" 2>/dev/null | sed 's/^$/-/')"
@@ -395,7 +401,7 @@ service_action() {
 }
 
 menu_ficha_servicio() {
-  local unit="$1"
+  local unit="$1" mc mcc
   while true; do
     ficha_header "$unit"
     show_unit_details "$unit"
@@ -405,9 +411,11 @@ menu_ficha_servicio() {
         echo "Conexiones TCP establecidas: $(conn_count 80)"
         ;;
       udpgw-7300)
-        echo "Conexiones TCP al 7300: $(conn_count 7300) de --max-clients $(udpgw_arg --max-clients | sed 's/^$/?/')"
+        mc="$(udpgw_arg --max-clients)"
+        mcc="$(udpgw_arg --max-connections-for-client)"
+        echo "Conexiones TCP al 7300: $(conn_count 7300) de --max-clients ${mc:-?}"
         echo "  (es el total del servidor, no por usuario; una conexión puede llevar varios flujos UDP)"
-        echo "Flujos UDP por conexión (--max-connections-for-client): $(udpgw_arg --max-connections-for-client | sed 's/^$/?/')"
+        echo "Flujos UDP por conexión (--max-connections-for-client): ${mcc:-?}"
         echo "El panel no cambia los límites ni la escucha de UDPGW."
         ;;
       hcr-8880)
@@ -469,12 +477,13 @@ menu_ficha_servicio() {
 }
 
 menu_ficha_ssh() {
-  local pa
+  local pa ports
   while true; do
     ficha_header ssh
     echo "Estado:      $(paint_state "$(ssh_state)")"
     echo "Unidad:      $(ssh_mode)"
-    echo "Puertos:     $(ssh_listen_ports | sed 's/^$/desconocido/')"
+    ports="$(ssh_listen_ports)"
+    echo "Puertos:     ${ports:-desconocido}"
     echo "PID:         $(protocol_pid ssh)"
     pa="$(sshd -T 2>/dev/null | awk '$1=="passwordauthentication"{print $2}')"
     echo "Acepta usuario y contraseña: ${pa:-no se pudo leer (sshd -T falló)}"
@@ -623,6 +632,105 @@ menu_estado() {
   done
 }
 
+# ------------------------------------------------------------------ AUTO
+# Cuenta del administrador que usa el panel: quien hizo sudo, o root.
+admin_account() {
+  local u="${SUDO_USER:-root}"
+  valid_user "$u" && getent passwd "$u" >/dev/null || return 1
+  id -nG "$u" 2>/dev/null | tr ' ' '\n' | grep -qx "$USERS_GROUP" && return 1
+  echo "$u"
+}
+
+auto_enabled() {
+  [[ -r "$AUTO_CONF" ]] && grep -qx -- "$1" "$AUTO_CONF"
+}
+
+write_auto_hook() {
+  local tmp
+  tmp="$(mktemp "${AUTO_HOOK%/*}/.vpsarg-auto.XXXXXX")" || return 1
+  cat > "$tmp" <<'EOF'
+# VPS ARG QuickStart - AUTO: abre el panel al iniciar sesión.
+# Lo crea y lo borra "vpsarg auto"; las cuentas están en /etc/vpsarg-auto.conf.
+# Solo en sesiones interactivas con terminal, una vez por sesión y nunca para las
+# cuentas del grupo vpsarg-usuarios. Al salir del panel sigue la consola.
+if [ -z "${VPSARG_AUTO_ABIERTO:-}" ] && [ -t 0 ] && [ -t 1 ] \
+   && [ -r /etc/vpsarg-auto.conf ] && [ -x /usr/local/sbin/vpsarg ]; then
+  case $- in
+    *i*)
+      vpsarg_auto_u="$(id -un 2>/dev/null)"
+      if grep -qx -- "$vpsarg_auto_u" /etc/vpsarg-auto.conf 2>/dev/null \
+         && ! id -nG "$vpsarg_auto_u" 2>/dev/null | tr ' ' '\n' | grep -qx vpsarg-usuarios; then
+        VPSARG_AUTO_ABIERTO=1
+        export VPSARG_AUTO_ABIERTO
+        trap ':' INT
+        if [ "$(id -u)" -eq 0 ]; then /usr/local/sbin/vpsarg; else sudo /usr/local/sbin/vpsarg; fi
+        trap - INT
+      fi
+      unset vpsarg_auto_u
+      ;;
+  esac
+fi
+EOF
+  chmod 0644 "$tmp" && mv -f "$tmp" "$AUTO_HOOK"
+}
+
+# auto_set CUENTA on|off
+auto_set() {
+  local user="$1" mode="$2" tmp
+  if [[ "$mode" == on ]]; then
+    tmp="$(mktemp /etc/.vpsarg-auto.XXXXXX)" || return 1
+    { [[ -r "$AUTO_CONF" ]] && grep -vx -- "$user" "$AUTO_CONF"; echo "$user"; } > "$tmp"
+    chmod 0644 "$tmp" && mv -f "$tmp" "$AUTO_CONF" && write_auto_hook || return 1
+  else
+    if [[ -r "$AUTO_CONF" ]]; then
+      tmp="$(mktemp /etc/.vpsarg-auto.XXXXXX)" || return 1
+      grep -vx -- "$user" "$AUTO_CONF" > "$tmp" || true
+      if [[ -s "$tmp" ]]; then
+        chmod 0644 "$tmp" && mv -f "$tmp" "$AUTO_CONF" || return 1
+      else
+        rm -f -- "$tmp" "$AUTO_CONF"
+      fi
+    fi
+    # Sin cuentas con AUTO no queda ningún archivo en /etc/profile.d.
+    [[ -s "$AUTO_CONF" ]] || rm -f -- "$AUTO_HOOK"
+  fi
+  log_action "accion=auto valor=$mode cuenta=$user resultado=ok"
+}
+
+show_auto() {
+  local u
+  u="$(admin_account)" || { echo "AUTO no disponible para la cuenta ${SUDO_USER:-root}."; return 1; }
+  if auto_enabled "$u"; then echo "AUTO: ON para $u"; else echo "AUTO: OFF para $u"; fi
+}
+
+cmd_auto() {
+  local u
+  u="$(admin_account)" || { echo "AUTO no disponible para la cuenta ${SUDO_USER:-root}." >&2; return 1; }
+  case "${1:-}" in
+    "") show_auto ;;
+    on|off) auto_set "$u" "$1" && show_auto ;;
+    *) usage; return 1 ;;
+  esac
+}
+
+menu_auto() {
+  local u
+  banner
+  echo "${B}CONFIGURACIÓN › AUTO INICIO${N}"; echo
+  u="$(admin_account)" || { echo "AUTO no está disponible para la cuenta ${SUDO_USER:-root}."; pause; return; }
+  show_auto
+  echo
+  echo "Con AUTO en ON, el panel se abre solo al iniciar sesión con $u en una terminal."
+  echo "Con 0 (Salir) o Ctrl+C se vuelve a la consola. No afecta a los usuarios SSH del servicio."
+  echo
+  if auto_enabled "$u"; then
+    confirm "¿Desactivar AUTO para $u?" && { auto_set "$u" off && echo "${G}Hecho.${N}"; show_auto; }
+  else
+    confirm "¿Activar AUTO para $u?" && { auto_set "$u" on && echo "${G}Hecho.${N}"; show_auto; }
+  fi
+  pause
+}
+
 # ------------------------------------------------------------------ configuración
 menu_configuracion() {
   local p
@@ -635,6 +743,7 @@ menu_configuracion() {
     echo "  3) Autenticación de SSH (solo lectura)"
     echo "  4) Registro del panel"
     echo "  5) Guardar copia de la configuración   6) Ver copias guardadas"
+    echo "  7) Auto inicio ($(show_auto 2>/dev/null | sed 's/ para .*//' || echo 'AUTO: no disponible'))"
     echo "  0) Volver"
     echo "El puerto 80 de PDirect-C, el 7300 de UDPGW y el puerto de sshd no se cambian desde el panel."
     ask "Opción: "
@@ -661,6 +770,7 @@ menu_configuracion() {
       4) journalctl -t "$LOG_TAG" -n 40 --no-pager; pause ;;
       5) make_backup; pause ;;
       6) ls -1 "$BACKUP_ROOT" 2>/dev/null || echo "No hay copias."; pause ;;
+      7) menu_auto ;;
       0|"") return ;;
       *) echo "Opción inválida."; sleep 1 ;;
     esac
@@ -762,6 +872,7 @@ main() {
     recursos) show_recursos ;;
     ssh) show_ssh ;;
     usuarios) "$USUARIOS" listar ;;
+    auto) (($# <= 2)) || { usage; exit 1; }; cmd_auto "${2:-}" ;;
     -h|--help|ayuda) usage ;;
     *) usage; exit 1 ;;
   esac
