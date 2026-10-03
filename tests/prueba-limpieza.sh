@@ -8,7 +8,8 @@
 set -uo pipefail
 
 SCRIPT="${1:?Uso: sudo bash tests/prueba-limpieza.sh /ruta/a/validacion-vps.sh}"
-[[ "$(systemd-detect-virt 2>/dev/null)" == docker ]] || { echo "Solo en el contenedor de laboratorio." >&2; exit 1; }
+# systemd 245 (Ubuntu 20.04) no detecta Docker anidado: también vale /.dockerenv.
+[[ "$(systemd-detect-virt 2>/dev/null)" == docker || -f /.dockerenv ]] || { echo "Solo en el contenedor de laboratorio." >&2; exit 1; }
 TEST_USER=vpsargprueba
 PW='Limpieza-2c.Clave'
 OUT=/tmp/limpieza

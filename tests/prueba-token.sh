@@ -9,7 +9,8 @@
 set -uo pipefail
 
 REPO="${1:?Uso: sudo bash tests/prueba-token.sh /ruta/al/repo}"
-[[ "$(systemd-detect-virt 2>/dev/null)" == docker ]] || { echo "Solo en el contenedor de laboratorio." >&2; exit 1; }
+# systemd 245 (Ubuntu 20.04) no detecta Docker anidado: también vale /.dockerenv.
+[[ "$(systemd-detect-virt 2>/dev/null)" == docker || -f /.dockerenv ]] || { echo "Solo en el contenedor de laboratorio." >&2; exit 1; }
 W=/tmp/prueba-token
 rm -rf "$W"; mkdir -p "$W/src"
 cp "$REPO"/{install.sh,pdirect.c,vpsarg-puertos.sh,vpsarg-hcr.sh,vpsarg-panel.sh,vpsarg-usuarios.sh,vpsarg-token.sh} "$W/src/"

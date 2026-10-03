@@ -52,6 +52,16 @@ login_ok() {
   done
   return 1
 }
+# wait_sessions USUARIO N: espera (hasta 70 s) a que el listado cuente N sesiones; deja WAITED en segundos.
+wait_sessions() {
+  local i
+  for i in $(seq 0 140); do
+    [[ "$(sessions_of "$1")" == "$2" ]] && { WAITED=$((i / 2)); return 0; }
+    sleep 0.5
+  done
+  WAITED=70
+  return 1
+}
 close_tunnel() { [[ -n "$TUN" ]] && kill "$TUN" 2>/dev/null; wait "$TUN" 2>/dev/null; TUN=""; }
 # Rechazo: ssh termina solo con error antes de 20 s (124 = quedó conectado).
 login_fails() {
@@ -145,6 +155,10 @@ check "listar cuenta 1 sesión de ana" test "$(sessions_of ana)" = 1
 close_tunnel
 check "ana entra a través de PDirect-C (TCP 80)" login_ok ana "$PW" pdirect
 close_tunnel
+# Con libevent 2.1.11 (Ubuntu 20.04) PDirect-C mantiene la conexión hacia SSH hasta su
+# espera de 60 s después de que el cliente se va; en 22.04/24.04 se libera enseguida.
+check "al cerrar el cliente, la sesión por PDirect-C se libera (hasta 70 s)" wait_sessions ana 0
+echo "      sesión liberada en ${WAITED} s"
 check "contraseña incorrecta: rechazada" login_fails ana "$PW2"
 check "ana no obtiene una shell" bash -c 'out="$(SSHPASS="$1" sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no ana@127.0.0.1 id 2>&1)"; [[ "$out" != *uid=* && "$out" == *"not available"* ]]' _ "$PW"
 
