@@ -15,6 +15,9 @@ USUARIOS="/usr/local/sbin/vpsarg-usuarios"
 BACKUP_ROOT="/var/backups/vpsarg"
 LOG_TAG="vpsarg-panel"
 KNOWN_UNITS=(pdirect-80 udpgw-7300 hcr-8880)
+# Protocolos que muestra el panel. SSH es solo de lectura.
+PROTOCOLS=(pdirect-80 udpgw-7300 hcr-8880 ssh)
+USERS_GROUP="vpsarg-usuarios"
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   B=$'\e[1m'; G=$'\e[32m'; R=$'\e[31m'; Y=$'\e[33m'; C=$'\e[36m'; N=$'\e[0m'
@@ -29,6 +32,8 @@ VPS ARG QuickStart - panel
 Uso:
   sudo vpsarg                 menú interactivo
   sudo vpsarg estado          estado de los servicios
+  sudo vpsarg protocolos      estado, puerto y PID de cada protocolo (incluye SSH)
+  sudo vpsarg sistema         CPU, RAM, disco, uptime, protocolos y usuarios conectados
   sudo vpsarg puertos         puertos configurados y en escucha
   sudo vpsarg conexiones      conexiones TCP establecidas por servicio
   sudo vpsarg recursos        memoria, CPU y descriptores de cada servicio
@@ -136,6 +141,40 @@ conn_count() {
   ss -Htn state established "( sport = :$1 )" 2>/dev/null | wc -l
 }
 
+unit_pid() {
+  local pid
+  pid="$(systemctl show -p MainPID --value "$1" 2>/dev/null || true)"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] && echo "$pid"
+  return 0
+}
+
+# SSH (solo lectura). En Ubuntu 24.04 puede arrancar por socket (ssh.socket):
+# ssh.service queda inactivo hasta la primera conexión.
+ssh_mode() {
+  if [[ "$(systemctl is-active ssh.socket 2>/dev/null)" == active ]]; then
+    echo "ssh.socket (activación por socket)"
+  else
+    echo "ssh.service"
+  fi
+}
+
+# ACTIVO, DETENIDO, ERROR o NO INSTALADO.
+ssh_state() {
+  local svc sock p ports any=0
+  unit_exists ssh.service || unit_exists ssh.socket || { echo "NO INSTALADO"; return; }
+  svc="$(systemctl is-active ssh.service 2>/dev/null || true)"
+  sock="$(systemctl is-active ssh.socket 2>/dev/null || true)"
+  if [[ "$svc" == active || "$sock" == active ]]; then
+    ports="$(ssh_listen_ports)"
+    for p in $ports; do listening "$p" && any=1; done
+    if [[ -n "$ports" ]] && ((any == 0)); then echo "ERROR"; else echo "ACTIVO"; fi
+  elif [[ "$svc" == failed || "$sock" == failed ]]; then
+    echo "ERROR"
+  else
+    echo "DETENIDO"
+  fi
+}
+
 udpgw_arg() {
   # Lee un argumento de la unidad de UDPGW sin modificarla.
   systemctl show -p ExecStart --value udpgw-7300 2>/dev/null \
@@ -144,9 +183,8 @@ udpgw_arg() {
 
 banner() {
   [[ -t 1 ]] && clear
-  echo "${C}${B}============================================${N}"
-  echo "${C}${B}            VPS ARG QuickStart${N}"
-  echo "${C}${B}============================================${N}"
+  echo "${C}${B}VPS ARG QUICKSTART${N}"
+  echo "${C}────────────────────${N}"
   echo "$(hostname) · $(date '+%Y-%m-%d %H:%M')"
   echo
 }
@@ -267,59 +305,336 @@ show_ssh() {
 }
 
 # ------------------------------------------------------------------ menús
-pick_service() {
-  # Lista los servicios instalados y deja la unidad elegida en PICKED.
-  local units=() unit i=1
-  PICKED=""
-  for unit in "${KNOWN_UNITS[@]}"; do
-    unit_exists "$unit" && units+=("$unit")
-  done
-  for unit in "${units[@]}"; do
-    echo "  $i) $(service_name "$unit") ($unit)"
-    i=$((i + 1))
-  done
-  echo "  0) Volver"
-  ask "Servicio: "
-  [[ "$REPLY" =~ ^[0-9]+$ ]] && ((REPLY >= 1 && REPLY <= ${#units[@]})) || return 1
-  PICKED="${units[$((REPLY - 1))]}"
+# ------------------------------------------------------------------ protocolos
+protocol_name() {
+  case "$1" in
+    ssh) echo "SSH" ;;
+    udpgw-7300) echo "UDPGW" ;;
+    *) service_name "$1" ;;
+  esac
 }
 
-menu_servicios() {
-  local action
+protocol_state() {
+  if [[ "$1" == ssh ]]; then ssh_state; else service_state "$1"; fi
+}
+
+protocol_port() {
+  if [[ "$1" == ssh ]]; then ssh_listen_ports; else service_port "$1" 2>/dev/null || true; fi
+}
+
+protocol_pid() {
+  local pid
+  if [[ "$1" == ssh ]]; then pid="$(unit_pid ssh)"; else pid="$(unit_pid "$1")"; fi
+  echo "${pid:--}"
+}
+
+show_protocolos() {
+  local p st
+  printf '%-12s %-14s %-12s %s\n' PROTOCOLO ESTADO PUERTO PID
+  for p in "${PROTOCOLS[@]}"; do
+    st="$(protocol_state "$p")"
+    printf '%-12s %s%*s %-12s %s\n' "$(protocol_name "$p")" "$(paint_state "$st")" $((14 - ${#st})) "" \
+      "$(protocol_port "$p" | sed 's/^$/-/')" "$(protocol_pid "$p")"
+  done
+}
+
+status_line() {
+  local p st out=""
+  for p in "${PROTOCOLS[@]}"; do
+    st="$(protocol_state "$p")"
+    if [[ "$st" == ACTIVO ]]; then
+      out+="$(protocol_name "$p") ${G}●${N} $(paint_state "$st")   "
+    else
+      out+="$(protocol_name "$p") ○ $(paint_state "$st")   "
+    fi
+  done
+  echo "${out%   }"
+}
+
+# Datos comunes de la ficha de un servicio systemd.
+show_unit_details() {
+  local unit="$1" st
+  st="$(protocol_state "$unit")"
+  if [[ "$st" == "NO INSTALADO" ]]; then
+    echo "Instalado:   no"
+    return
+  fi
+  echo "Instalado:   sí (unidad $unit)"
+  echo "Estado:      $(paint_state "$st")"
+  echo "Puerto:      $(protocol_port "$unit" | sed 's/^$/-/')"
+  echo "PID:         $(protocol_pid "$unit")"
+  echo "Arranque:    $(systemctl is-enabled "$unit" 2>/dev/null || echo desconocido)"
+  echo "Activo desde: $(systemctl show -p ActiveEnterTimestamp --value "$unit" 2>/dev/null | sed 's/^$/-/')"
+  echo "Reinicios automáticos: $(systemctl show -p NRestarts --value "$unit" 2>/dev/null | sed 's/^$/-/')"
+}
+
+show_recent_errors() {
+  local out
+  out="$(journalctl -u "$1" -p warning -n 5 --no-pager -o short 2>/dev/null | grep -v '^-- ' || true)"
+  echo "Últimas advertencias o errores:"
+  if [[ -n "$out" ]]; then printf '  %s\n' "${out//$'\n'/$'\n'  }"; else echo "  ninguno"; fi
+}
+
+ficha_header() {
+  banner
+  echo "${B}PROTOCOLOS › $(protocol_name "$1")${N}"; echo
+}
+
+# Acciones permitidas sobre PDirect-C, UDPGW y HCR. Nunca sobre SSH.
+service_action() {
+  local unit="$1" action="$2"
+  if [[ "$action" =~ ^(detener|reiniciar|deshabilitar)$ ]]; then
+    confirm "¿$action $(protocol_name "$unit")? Las conexiones abiertas de ese servicio se cortan." || return 0
+  fi
+  if [[ "$unit" == hcr-8880 && "$action" =~ ^(iniciar|detener|reiniciar)$ ]]; then
+    run_logged "accion=$action servicio=$unit" "$HCR" "$action"
+  else
+    run_logged "accion=$action servicio=$unit" "$PUERTOS" "$action" "$unit"
+  fi
+  pause
+}
+
+menu_ficha_servicio() {
+  local unit="$1"
   while true; do
-    banner
-    echo "${B}SERVICIOS${N}"; echo
-    show_estado; echo
-    echo "  1) Iniciar   2) Detener   3) Reiniciar   4) Habilitar al arranque   5) Deshabilitar al arranque"
+    ficha_header "$unit"
+    show_unit_details "$unit"
+    case "$unit" in
+      pdirect-80)
+        echo "Destino:     127.0.0.1:$(conf_value "$PDIRECT_CONF" SSH_PORT || echo '?') (SSH)"
+        echo "Conexiones TCP establecidas: $(conn_count 80)"
+        ;;
+      udpgw-7300)
+        echo "Conexiones TCP al 7300: $(conn_count 7300) de --max-clients $(udpgw_arg --max-clients | sed 's/^$/?/')"
+        echo "  (es el total del servidor, no por usuario; una conexión puede llevar varios flujos UDP)"
+        echo "Flujos UDP por conexión (--max-connections-for-client): $(udpgw_arg --max-connections-for-client | sed 's/^$/?/')"
+        echo "El panel no cambia los límites ni la escucha de UDPGW."
+        ;;
+      hcr-8880)
+        if hcr_installed; then
+          echo "Conexiones TCP establecidas: $(conn_count "$(service_port hcr-8880)")"
+        fi
+        echo "${Y}HCR todavía no está validado para producción: falta una prueba con un cliente HCR,"
+        echo "verificar IPv6 y repetir las pruebas en una VPS de laboratorio.${N}"
+        ;;
+    esac
+    echo
+    if [[ "$unit" == hcr-8880 ]] && ! hcr_installed; then
+      echo "  1) Instalar   0) Volver"
+      ask "Opción: "
+      case "$REPLY" in
+        1)
+          echo "Se usa /opt/hcr/hcr-server (copialo antes por SFTP), el puerto configurado"
+          echo "(8880 si es la primera vez) y el destino SSH de PDirect-C."
+          confirm "¿Instalar HCR?" && run_logged "accion=instalar servicio=hcr-8880" "$HCR" instalar
+          pause
+          ;;
+        0|"") return ;;
+        *) echo "Opción inválida."; sleep 1 ;;
+      esac
+      continue
+    fi
+    if ! unit_exists "$unit"; then
+      echo "No está instalado. Se instala con el instalador de VPS ARG QuickStart."
+      pause
+      return
+    fi
+    echo "  1) Iniciar     2) Detener     3) Reiniciar"
+    echo "  4) Habilitar al arranque      5) Deshabilitar al arranque"
+    echo "  6) Ver registro               7) Ver errores recientes"
+    [[ "$unit" == hcr-8880 ]] && echo "  8) Desinstalar HCR"
     echo "  0) Volver"
     ask "Opción: "
     case "$REPLY" in
-      1) action=iniciar ;; 2) action=detener ;; 3) action=reiniciar ;;
-      4) action=habilitar ;; 5) action=deshabilitar ;;
+      1) service_action "$unit" iniciar ;;
+      2) service_action "$unit" detener ;;
+      3) service_action "$unit" reiniciar ;;
+      4) service_action "$unit" habilitar ;;
+      5) service_action "$unit" deshabilitar ;;
+      6) echo; journalctl -u "$unit" -n 40 --no-pager; pause ;;
+      7) echo; show_recent_errors "$unit"; pause ;;
+      8)
+        if [[ "$unit" == hcr-8880 ]]; then
+          confirm "¿Desinstalar HCR? No se tocan PDirect-C, UDPGW ni /opt/hcr." \
+            && run_logged "accion=desinstalar servicio=hcr-8880" "$HCR" desinstalar
+          pause
+        else
+          echo "Opción inválida."; sleep 1
+        fi
+        ;;
       0|"") return ;;
-      *) echo "Opción inválida."; sleep 1; continue ;;
+      *) echo "Opción inválida."; sleep 1 ;;
     esac
-    pick_service || continue
-    if [[ "$action" != iniciar && "$action" != habilitar ]]; then
-      confirm "¿$action $(service_name "$PICKED")? Las conexiones abiertas de ese servicio se cortan." || continue
-    fi
-    if [[ "$PICKED" == hcr-8880 && "$action" =~ ^(iniciar|detener|reiniciar)$ ]]; then
-      run_logged "accion=$action servicio=$PICKED" "$HCR" "$action"
-    else
-      run_logged "accion=$action servicio=$PICKED" "$PUERTOS" "$action" "$PICKED"
-    fi
-    pause
   done
 }
 
-menu_puertos() {
+menu_ficha_ssh() {
+  local pa
+  while true; do
+    ficha_header ssh
+    echo "Estado:      $(paint_state "$(ssh_state)")"
+    echo "Unidad:      $(ssh_mode)"
+    echo "Puertos:     $(ssh_listen_ports | sed 's/^$/desconocido/')"
+    echo "PID:         $(protocol_pid ssh)"
+    pa="$(sshd -T 2>/dev/null | awk '$1=="passwordauthentication"{print $2}')"
+    echo "Acepta usuario y contraseña: ${pa:-no se pudo leer (sshd -T falló)}"
+    echo "Sesiones SSH de cuentas VPS ARG: $(managed_sessions_total)"
+    echo
+    echo "SSH es solo de lectura: el panel no lo detiene, no lo reinicia y no modifica sshd_config."
+    echo
+    echo "  1) Ver registro   2) Ver errores recientes   0) Volver"
+    ask "Opción: "
+    case "$REPLY" in
+      1) echo; journalctl -u ssh -n 40 --no-pager; pause ;;
+      2) echo; show_recent_errors ssh; pause ;;
+      0|"") return ;;
+      *) echo "Opción inválida."; sleep 1 ;;
+    esac
+  done
+}
+
+menu_protocolos() {
+  while true; do
+    banner
+    echo "${B}PROTOCOLOS${N}"; echo
+    show_protocolos; echo
+    echo "  1) PDirect-C   2) UDPGW   3) HCR   4) SSH"
+    echo "  5) Actualizar estados      0) Volver"
+    ask "Opción: "
+    case "$REPLY" in
+      1) menu_ficha_servicio pdirect-80 ;;
+      2) menu_ficha_servicio udpgw-7300 ;;
+      3) menu_ficha_servicio hcr-8880 ;;
+      4) menu_ficha_ssh ;;
+      5) ;;
+      0|"") return ;;
+      *) echo "Opción inválida."; sleep 1 ;;
+    esac
+  done
+}
+
+# ------------------------------------------------------------------ estado
+# Una sola lectura de procesos: cuenta las sesiones SSH (sshd o sshd-session con el UID
+# de la cuenta) de cada cuenta administrada. Deja "usuario sesiones" por línea.
+managed_sessions() {
+  local members user uid uids=""
+  members="$(getent group "$USERS_GROUP" 2>/dev/null | cut -d: -f4 | tr ',' ' ')"
+  for user in $members; do
+    uid="$(id -u "$user" 2>/dev/null)" || continue
+    ((uid >= 1000 && uid != 65534)) && uids+="$uid=$user "
+  done
+  [[ -n "$uids" ]] || return 0
+  ps -e -o uid=,comm= 2>/dev/null | awk -v map="$uids" '
+    BEGIN { n = split(map, a, " "); for (i = 1; i <= n; i++) { split(a[i], kv, "="); name[kv[1]] = kv[2]; cnt[kv[1]] = 0 } }
+    ($2 == "sshd" || $2 == "sshd-session") && ($1 in name) { cnt[$1]++ }
+    END { for (u in name) print name[u], cnt[u] }' | sort
+}
+
+managed_sessions_total() {
+  managed_sessions | awk '{t += $2} END {print t + 0}'
+}
+
+human_kb() {
+  awk -v k="$1" 'BEGIN { if (k >= 1048576) printf "%.1f GB", k / 1048576; else printf "%d MB", k / 1024 }'
+}
+
+cpu_percent() {
+  # Dos lecturas de /proc/stat separadas medio segundo.
+  local a b
+  a="$(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8+$9, $5+$6}' /proc/stat)"
+  sleep 0.5
+  b="$(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8+$9, $5+$6}' /proc/stat)"
+  awk -v a="$a" -v b="$b" 'BEGIN { split(a, x, " "); split(b, y, " "); t = y[1] - x[1]; i = y[2] - x[2];
+    if (t > 0) printf "%d %%", (t - i) * 100 / t + 0.5; else print "-" }'
+}
+
+uptime_text() {
+  awk '{ s = int($1); d = int(s / 86400); h = int(s % 86400 / 3600); m = int(s % 3600 / 60);
+    if (d > 0) printf "%d %s %d %s\n", d, (d == 1 ? "día" : "días"), h, (h == 1 ? "hora" : "horas");
+    else printf "%d %s %d %s\n", h, (h == 1 ? "hora" : "horas"), m, (m == 1 ? "minuto" : "minutos") }' /proc/uptime
+}
+
+temperature() {
+  local f t
+  for f in /sys/class/thermal/thermal_zone*/temp; do
+    [[ -r "$f" ]] || continue
+    t="$(cat "$f" 2>/dev/null)" || continue
+    [[ "$t" =~ ^[0-9]+$ ]] && ((t > 0)) && { echo "$((t / 1000)) °C"; return; }
+  done
+  echo "no disponible"
+}
+
+show_sistema() {
+  local mt ma st sf
+  mt="$(awk '/^MemTotal:/{print $2}' /proc/meminfo)"
+  ma="$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)"
+  st="$(awk '/^SwapTotal:/{print $2}' /proc/meminfo)"
+  sf="$(awk '/^SwapFree:/{print $2}' /proc/meminfo)"
+  printf '%-10s %s (%s núcleos)\n' "CPU:" "$(cpu_percent)" "$(nproc)"
+  printf '%-10s %s\n' "CARGA:" "$(cut -d' ' -f1-3 /proc/loadavg) (1, 5 y 15 min)"
+  printf '%-10s %s / %s (disponible %s)\n' "RAM:" "$(human_kb $((mt - ma)))" "$(human_kb "$mt")" "$(human_kb "$ma")"
+  if ((st > 0)); then
+    printf '%-10s %s / %s\n' "SWAP:" "$(human_kb $((st - sf)))" "$(human_kb "$st")"
+  else
+    printf '%-10s %s\n' "SWAP:" "sin swap"
+  fi
+  df -Pk / | awk 'NR==2{print $3, $2}' | while read -r used total; do
+    printf '%-10s %s / %s\n' "DISCO /:" "$(human_kb "$used")" "$(human_kb "$total")"
+  done
+  printf '%-10s %s\n' "UPTIME:" "$(uptime_text)"
+  printf '%-10s %s\n' "TEMP:" "$(temperature)"
+}
+
+show_conectados() {
+  local list n
+  list="$(managed_sessions | awk '$2 > 0')"
+  n="$(grep -c . <<<"$list" || true)"
+  echo "Usuarios conectados: $n · sesiones SSH: $(awk '{t += $2} END {print t + 0}' <<<"$list")"
+  [[ -n "$list" ]] && awk '{printf "  %-20s %s\n", $1, $2}' <<<"$list"
+  return 0
+}
+
+show_estado_general() {
+  echo "${B}Servidor${N}"
+  show_sistema
+  echo
+  echo "${B}Protocolos${N}"
+  show_protocolos
+  echo
+  echo "${B}Conexiones${N}"
+  show_conectados
+}
+
+menu_estado() {
+  while true; do
+    banner
+    echo "${B}ESTADO${N}"; echo
+    show_estado_general; echo
+    echo "  1) Actualizar   2) Conexiones TCP por servicio   3) Recursos de cada servicio"
+    echo "  0) Volver"
+    ask "Opción: "
+    case "$REPLY" in
+      1) ;;
+      2) echo; show_conexiones; pause ;;
+      3) echo; show_recursos; pause ;;
+      0|"") return ;;
+      *) echo "Opción inválida."; sleep 1 ;;
+    esac
+  done
+}
+
+# ------------------------------------------------------------------ configuración
+menu_configuracion() {
   local p
   while true; do
     banner
-    echo "${B}PUERTOS${N}"; echo
+    echo "${B}CONFIGURACIÓN${N}"; echo
     show_puertos; echo
     echo "  1) Cambiar el puerto SSH de destino (PDirect-C y HCR)"
     echo "  2) Cambiar el puerto de HCR"
+    echo "  3) Autenticación de SSH (solo lectura)"
+    echo "  4) Registro del panel"
+    echo "  5) Guardar copia de la configuración   6) Ver copias guardadas"
     echo "  0) Volver"
     echo "El puerto 80 de PDirect-C, el 7300 de UDPGW y el puerto de sshd no se cambian desde el panel."
     ask "Opción: "
@@ -342,40 +657,10 @@ menu_puertos() {
           && run_logged "accion=puerto-hcr valor=$p" "$HCR" puerto "$p"
         pause
         ;;
-      0|"") return ;;
-      *) echo "Opción inválida."; sleep 1 ;;
-    esac
-  done
-}
-
-menu_hcr() {
-  while true; do
-    banner
-    echo "${B}HCR${N}"; echo
-    if hcr_installed; then
-      "$HCR" estado 2>&1 || true
-    else
-      echo "HCR no está instalado."
-    fi
-    echo
-    echo "${Y}HCR todavía no está validado para producción: falta una prueba con un cliente HCR,"
-    echo "verificar IPv6 y repetir las pruebas en una VPS de laboratorio.${N}"
-    echo
-    echo "  1) Instalar   2) Desinstalar   0) Volver"
-    ask "Opción: "
-    case "$REPLY" in
-      1)
-        echo "Se usa /opt/hcr/hcr-server (copialo antes por SFTP), el puerto configurado"
-        echo "(8880 si es la primera vez) y el destino SSH de PDirect-C."
-        confirm "¿Instalar HCR?" && run_logged "accion=instalar servicio=hcr-8880" "$HCR" instalar
-        pause
-        ;;
-      2)
-        hcr_installed || { echo "HCR no está instalado."; pause; continue; }
-        confirm "¿Desinstalar HCR? No se tocan PDirect-C, UDPGW ni /opt/hcr." \
-          && run_logged "accion=desinstalar servicio=hcr-8880" "$HCR" desinstalar
-        pause
-        ;;
+      3) echo; show_ssh; pause ;;
+      4) journalctl -t "$LOG_TAG" -n 40 --no-pager; pause ;;
+      5) make_backup; pause ;;
+      6) ls -1 "$BACKUP_ROOT" 2>/dev/null || echo "No hay copias."; pause ;;
       0|"") return ;;
       *) echo "Opción inválida."; sleep 1 ;;
     esac
@@ -387,9 +672,9 @@ menu_usuarios() {
   [[ -x "$USUARIOS" ]] || { pending "USUARIOS SSH" "No está instalado $USUARIOS."; return; }
   while true; do
     banner
-    echo "${B}USUARIOS SSH${N}"; echo
+    echo "${B}USUARIOS${N}"; echo
     if [[ "$(sshd -T 2>/dev/null | awk '$1=="passwordauthentication"{print $2}')" != yes ]]; then
-      echo "${Y}AVISO: SSH no acepta contraseñas o no se pudo comprobar (ver Diagnóstico > Autenticación de SSH).${N}"
+      echo "${Y}AVISO: SSH no acepta contraseñas o no se pudo comprobar (ver Configuración > Autenticación de SSH).${N}"
       echo
     fi
     "$USUARIOS" listar 2>&1 || true
@@ -419,6 +704,7 @@ menu_usuarios() {
   done
 }
 
+
 make_backup() {
   local dir f files=()
   dir="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)-panel"
@@ -433,28 +719,6 @@ make_backup() {
   log_action "accion=copia destino=$dir resultado=ok"
 }
 
-menu_diagnostico() {
-  while true; do
-    banner
-    echo "${B}DIAGNÓSTICO Y RECURSOS${N}"; echo
-    echo "  1) Conexiones TCP activas          2) Consumo de recursos"
-    echo "  3) Autenticación de SSH            4) Registro de un servicio"
-    echo "  5) Registro del panel              6) Guardar copia de la configuración"
-    echo "  7) Ver copias guardadas            0) Volver"
-    ask "Opción: "
-    case "$REPLY" in
-      1) echo; show_conexiones; pause ;;
-      2) echo; show_recursos; pause ;;
-      3) echo; show_ssh; pause ;;
-      4) pick_service && journalctl -u "$PICKED" -n 40 --no-pager; pause ;;
-      5) journalctl -t "$LOG_TAG" -n 40 --no-pager; pause ;;
-      6) make_backup; pause ;;
-      7) ls -1 "$BACKUP_ROOT" 2>/dev/null || echo "No hay copias."; pause ;;
-      0|"") return ;;
-      *) echo "Opción inválida."; sleep 1 ;;
-    esac
-  done
-}
 
 pending() {
   banner
@@ -463,23 +727,23 @@ pending() {
   pause
 }
 
+
 main_menu() {
   while true; do
     banner
-    show_estado
+    status_line
     echo
-    echo "  1) Servicios                4) HCR"
-    echo "  2) Puertos                  5) Diagnóstico y recursos"
-    echo "  3) Usuarios SSH             6) Ancho de banda"
-    echo "  0) Salir"
+    echo "[ 1 ] PROTOCOLOS"
+    echo "[ 2 ] USUARIOS"
+    echo "[ 3 ] ESTADO"
+    echo "[ 4 ] CONFIGURACIÓN"
+    echo "[ 0 ] SALIR"
     ask "Opción: "
     case "$REPLY" in
-      1) menu_servicios ;;
-      2) menu_puertos ;;
-      3) menu_usuarios ;;
-      4) menu_hcr ;;
-      5) menu_diagnostico ;;
-      6) pending "ANCHO DE BANDA" "Pendiente: la medición de tráfico todavía no está habilitada." ;;
+      1) menu_protocolos ;;
+      2) menu_usuarios ;;
+      3) menu_estado ;;
+      4) menu_configuracion ;;
       0|"") return 0 ;;
       *) echo "Opción inválida."; sleep 1 ;;
     esac
@@ -491,6 +755,8 @@ main() {
   case "${1:-}" in
     "") main_menu ;;
     estado) show_estado ;;
+    protocolos) show_protocolos ;;
+    sistema) show_estado_general ;;
     puertos) show_puertos ;;
     conexiones) show_conexiones ;;
     recursos) show_recursos ;;

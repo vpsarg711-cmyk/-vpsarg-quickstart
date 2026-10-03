@@ -504,7 +504,7 @@ sleep 1
 checkpoint sshd-temporal
 UG_PID6="$(pid_of udpgw-7300)"
 DEST_CHANGED=1
-panel "2\n1\n2222\ns\n\n0\n0\n"
+panel "4\n1\n2222\ns\n\n0\n0\n"
 checkpoint destino-cambiado
 check "cambio a 2222 desde el panel" bash -c 'grep -q "^Hecho" "$1"' _ "$DIR/panel.out"
 check "PDirect-C usa 2222" test "$(pd_port)" = 2222
@@ -514,7 +514,7 @@ if hcr_installed; then
   checkpoint hcr
 fi
 check "UDPGW sin cambios (PID $UG_PID6)" test "$(pid_of udpgw-7300)" = "$UG_PID6"
-panel "2\n1\n$SSH_PORT\ns\n\n0\n0\n"
+panel "4\n1\n$SSH_PORT\ns\n\n0\n0\n"
 check "volver a $SSH_PORT" test "$(pd_port)" = "$SSH_PORT"
 if hcr_installed; then check "HCR vuelve a 127.0.0.1:$SSH_PORT" test "$(hcr_target)" = "127.0.0.1:$SSH_PORT"; fi
 stop_tmp_sshd || echo "AVISO: el sshd temporal no se detuvo; la limpieza final lo reintenta."
@@ -525,7 +525,7 @@ ONESHOT=$!
 sleep 1
 checkpoint respondedor
 PD_PID6="$(pid_of pdirect-80)"
-panel "2\n1\n2223\ns\n\n0\n0\n"
+panel "4\n1\n2223\ns\n\n0\n0\n"
 echo "--- salida de puerto-ssh 2223:"; grep -E "PDirect-C|Reversión|ATENCIÓN|ERROR|falló" "$DIR/panel.out"
 stop_oneshot
 check "puerto-ssh 2223 falla" bash -c 'grep -q "La operación falló" "$1"' _ "$DIR/panel.out"

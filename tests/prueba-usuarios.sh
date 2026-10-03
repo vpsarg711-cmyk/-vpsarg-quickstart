@@ -197,7 +197,7 @@ EOF
 chmod 0755 /tmp/sshd-falso/sshd
 check "crear con PasswordAuthentication no: avisa" \
   bash -c 'echo "$1" | PATH=/tmp/sshd-falso:$PATH vpsarg-usuarios crear carla 2>&1 | grep -q "SSH no acepta contraseñas"' _ "$PW"
-check "el panel avisa en Usuarios SSH" bash -c 'printf "3\n\n0\n" | PATH=/tmp/sshd-falso:$PATH timeout 30 vpsarg 2>&1 | grep -q "AVISO: SSH no acepta contraseñas"'
+check "el panel avisa en Usuarios" bash -c 'printf "2\n\n0\n" | PATH=/tmp/sshd-falso:$PATH timeout 30 vpsarg 2>&1 | grep -q "AVISO: SSH no acepta contraseñas"'
 check "vpsarg ssh informa PasswordAuthentication no" bash -c 'PATH=/tmp/sshd-falso:$PATH vpsarg ssh | grep -q "PasswordAuthentication no"'
 vpsarg-usuarios eliminar carla >/dev/null 2>&1
 
@@ -220,22 +220,25 @@ check "registro: eliminar ok" journal_has "accion=eliminar usuario=ana resultado
 check "eliminar otra vez falla" bash -c '! vpsarg-usuarios eliminar ana >/dev/null 2>&1'
 
 echo "### Desde el menú del panel"
-printf '3\n1\nbeto\n%s\n\n0\n0\n' "$PW" | timeout 60 vpsarg > "$OUT" 2>&1
+printf '2\n1\nbeto\n%s\n\n0\n0\n' "$PW" | timeout 60 vpsarg > "$OUT" 2>&1
 check "panel: crear beto" bash -c 'getent passwd beto >/dev/null && id -nG beto | grep -qw vpsarg-usuarios'
 check "panel: beto entra" login_ok beto "$PW"
+check "estado: beto figura conectado con 1 sesión" bash -c 'vpsarg sistema | grep -qE "^  beto +1$"'
+check "estado: cuenta 1 usuario conectado" bash -c 'vpsarg sistema | grep -q "^Usuarios conectados: 1 · sesiones SSH: 1$"'
 close_tunnel
-printf '3\n1\nB;ad\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
+check "estado: beto ya no figura conectado" bash -c 'sleep 1; ! vpsarg sistema | grep -qE "^  beto "'
+printf '2\n1\nB;ad\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
 check "panel: nombre inválido" has "Nombre no válido"
-printf '3\n3\nbeto\nn\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
+printf '2\n3\nbeto\nn\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
 check "panel: responder n no suspende" test -z "$(expire beto)"
-printf '3\n3\nbeto\ns\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
+printf '2\n3\nbeto\ns\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
 check "panel: suspender beto" test "$(expire beto)" = 0
 check "panel: el listado muestra SUSPENDIDO" has "beto .*SUSPENDIDO"
-printf '3\n4\nbeto\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
+printf '2\n4\nbeto\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
 check "panel: reactivar beto" test -z "$(expire beto)"
-printf '3\n5\nbeto\nbetx\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
+printf '2\n5\nbeto\nbetx\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
 check "panel: confirmación distinta no elimina" bash -c 'getent passwd beto >/dev/null'
-printf '3\n5\nbeto\nbeto\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
+printf '2\n5\nbeto\nbeto\n\n0\n0\n' | timeout 60 vpsarg > "$OUT" 2>&1
 check "panel: eliminar beto" bash -c '! getent passwd beto >/dev/null'
 
 echo "### Lo que no debe cambiar"

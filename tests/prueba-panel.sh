@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pruebas de laboratorio del panel vpsarg (Fase 2B; los usuarios están en prueba-usuarios.sh).
+# Pruebas de laboratorio del panel vpsarg (Fase 2B y etapa 3A; los usuarios están en prueba-usuarios.sh).
 # SOLO para una máquina o contenedor de laboratorio con QuickStart instalado y HCR
 # sin instalar: inicia un sshd extra en 127.0.0.1:2222, instala y desinstala HCR
 # y maneja el menú enviándole respuestas por la entrada estándar.
@@ -65,25 +65,53 @@ check "recursos: muestra PDirect-C y UDPGW con su PID" \
   bash -c 'o="$(vpsarg recursos)"; grep -q "^PDirect-C *$(systemctl show -p MainPID --value pdirect-80) " <<<"$o" && grep -q "^BadVPN UDPGW *$(systemctl show -p MainPID --value udpgw-7300) " <<<"$o"'
 check "ssh: informa PasswordAuthentication según sshd -T" \
   bash -c 'pa="$(sshd -T | awk '"'"'$1=="passwordauthentication"{print $2}'"'"')"; vpsarg ssh | grep -q "PasswordAuthentication $pa"'
-panel "3\n\n6\n\n0\n"
-check "Ancho de banda figura como pendiente" bash -c '[[ $(grep -c "^Pendiente: la medición de tráfico" '"$OUT"') == 1 ]]'
-check "Usuarios SSH abre el listado de cuentas" grep -q "^USUARIO *UID *ESTADO" "$OUT"
+panel "2\n\n0\n"
+check "Usuarios abre el listado de cuentas" grep -q "^USUARIO *UID *ESTADO" "$OUT"
 check "el menú termina al cerrarse la entrada" bash -c 'printf "" | timeout 10 vpsarg >/dev/null 2>&1'
 
+echo "### Menú principal, Protocolos y Estado (etapa 3A)"
+panel "0\n"
+check "menú principal: 4 secciones" bash -c 'for s in "[ 1 ] PROTOCOLOS" "[ 2 ] USUARIOS" "[ 3 ] ESTADO" "[ 4 ] CONFIGURACIÓN" "[ 0 ] SALIR"; do grep -qF "$s" '"$OUT"' || exit 1; done'
+check "menú principal: línea de estado con los 4 protocolos" bash -c 'grep -q "PDirect-C ● ACTIVO.*UDPGW ● ACTIVO.*HCR ○ NO INSTALADO.*SSH ● ACTIVO" '"$OUT"''
+check "protocolos: PDirect-C ACTIVO, puerto 80 y su PID" bash -c 'vpsarg protocolos | grep -qE "^PDirect-C +ACTIVO +80 +$(systemctl show -p MainPID --value pdirect-80)$"'
+check "protocolos: UDPGW ACTIVO, puerto 7300 y su PID" bash -c 'vpsarg protocolos | grep -qE "^UDPGW +ACTIVO +7300 +$(systemctl show -p MainPID --value udpgw-7300)$"'
+check "protocolos: HCR NO INSTALADO sin puerto ni PID" bash -c 'vpsarg protocolos | grep -qE "^HCR +NO INSTALADO +- +-$"'
+check "protocolos: SSH ACTIVO en 22" bash -c 'vpsarg protocolos | grep -qE "^SSH +ACTIVO +22 +"'
+SSHD_PID0="$(pid_of ssh)"
+panel "1\n4\n9\n2\n\n1\n\n0\n0\n0\n"
+check "ficha SSH: es solo de lectura" has "SSH es solo de lectura"
+check "ficha SSH: no ofrece detener ni reiniciar" bash -c '! sed -n "/PROTOCOLOS › SSH/,\$p" '"$OUT"' | grep -q "Detener\|Reiniciar"'
+check "ficha SSH: opción inválida rechazada" has "Opción inválida"
+check "SSH no se reinició (PID $SSHD_PID0)" test "$(pid_of ssh)" = "$SSHD_PID0"
+panel "1\n2\n7\n\n0\n0\n0\n"
+check "ficha UDPGW: límite como conexiones TCP del servidor, no por usuario" bash -c 'grep -q "Conexiones TCP al 7300: [0-9]* de --max-clients 3" '"$OUT"' && grep -q "no por usuario" '"$OUT"''
+check "ficha UDPGW: PID y reinicios" bash -c 'grep -q "^PID: *$(systemctl show -p MainPID --value udpgw-7300)$" '"$OUT"' && grep -q "^Reinicios automáticos:" '"$OUT"''
+check "ficha UDPGW: errores recientes" has "Últimas advertencias o errores:"
+panel "1\n1\n\n0\n0\n"
+check "ficha PDirect-C: destino SSH" has "Destino: *127.0.0.1:22 (SSH)"
+panel "1\n5\n0\n0\n"
+check "Actualizar estados vuelve a mostrar la tabla" test "$(grep -c "^PROTOCOLO *ESTADO *PUERTO *PID" "$OUT")" = 2
+check "sistema: CPU, carga, RAM, swap, disco, uptime y temperatura" bash -c 'o="$(vpsarg sistema)"; for k in "CPU:" "CARGA:" "RAM:" "SWAP:" "DISCO /:" "UPTIME:" "TEMP:"; do grep -q "^$k" <<<"$o" || exit 1; done'
+check "sistema: CPU en porcentaje" bash -c 'vpsarg sistema | grep -qE "^CPU: +[0-9]+ % \([0-9]+ núcleos\)$"'
+check "sistema: RAM total coincide con /proc/meminfo" bash -c 'k=$(awk "/^MemTotal:/{print \$2}" /proc/meminfo); t=$(awk -v k=$k "BEGIN{if (k>=1048576) printf \"%.1f GB\", k/1048576; else printf \"%d MB\", k/1024}"); vpsarg sistema | grep -q "^RAM: .* / $t "'
+check "sistema: sin usuarios conectados" bash -c 'vpsarg sistema | grep -q "^Usuarios conectados: 0 · sesiones SSH: 0$"'
+panel "3\n1\n0\n0\n"
+check "Estado: muestra servidor, protocolos y conexiones" bash -c 'grep -q "^Servidor" '"$OUT"' && grep -q "^Protocolos" '"$OUT"' && grep -q "^Conexiones" '"$OUT"''
+
 echo "### Entradas inválidas"
-panel "abc\n9\n;id\n2\n1\n80; touch /tmp/inyectado\n\n1\n\$(touch /tmp/inyectado)\n\n1\n99999\n\n1\n-1\n\n0\n0\n"
+panel "abc\n9\n;id\n4\n1\n80; touch /tmp/inyectado\n\n1\n\$(touch /tmp/inyectado)\n\n1\n99999\n\n1\n-1\n\n0\n0\n"
 check "rechaza puertos SSH inválidos (4 intentos)" test "$(grep -c "Puerto no válido" "$OUT")" = 4
 check "rechaza opciones de menú inválidas" has "Opción inválida"
 check "nada se ejecutó desde la entrada" test ! -e /tmp/inyectado
 check "PDirect-C sigue en 22" test "$(pd_port)" = 22
-panel "2\n2\n0\n0\n"
+panel "4\n2\n\n0\n0\n"
 check "cambiar puerto de HCR sin HCR instalado lo informa" has "HCR no está instalado"
 
 echo "### HCR desde el panel"
-panel "4\n1\nn\n\n0\n0\n"
+panel "1\n3\n1\nn\n\n0\n0\n0\n"
 check "responder n no instala" bash -c '! systemctl cat hcr-8880 >/dev/null 2>&1'
-check "el menú HCR avisa que no está validado para producción" has "no está validado para producción"
-VPSARG_TOKEN="$(lab_token prueba-panel-1)" panel "4\n1\ns\n\n0\n0\n"
+check "la ficha de HCR avisa que no está validado para producción" has "no está validado para producción"
+VPSARG_TOKEN="$(lab_token prueba-panel-1)" panel "1\n3\n1\ns\n\n0\n0\n0\n"
 check "instalar HCR" systemctl is-active --quiet hcr-8880
 check "HCR ACTIVO en 8880" test "$(state_line '^HCR')" = "ACTIVO 8880"
 check "registro: instalar ok" journal_has "accion=instalar servicio=hcr-8880 resultado=ok"
@@ -93,50 +121,50 @@ check "conexiones: HCR límite 2048 conexiones TCP" bash -c 'vpsarg conexiones |
 
 echo "### Servicios"
 P1="$(pid_of hcr-8880)"
-panel "1\n2\n3\nn\n0\n0\n"
+panel "1\n3\n2\nn\n0\n0\n0\n"
 check "responder n a detener no detiene" test "$(pid_of hcr-8880)" = "$P1"
-panel "1\n2\n3\ns\n\n0\n0\n"
+panel "1\n3\n2\ns\n\n0\n0\n0\n"
 check "detener HCR" bash -c '! systemctl is-active --quiet hcr-8880'
 check "estado DETENIDO" test "$(state_line '^HCR')" = "DETENIDO 8880"
 check "registro: detener ok" journal_has "accion=detener servicio=hcr-8880 resultado=ok"
-panel "1\n1\n3\n\n0\n0\n"
+panel "1\n3\n1\n\n0\n0\n0\n"
 check "iniciar HCR" systemctl is-active --quiet hcr-8880
 P2="$(pid_of hcr-8880)"
-panel "1\n3\n3\ns\n\n0\n0\n"
+panel "1\n3\n3\ns\n\n0\n0\n0\n"
 check "reiniciar HCR cambia el PID" bash -c "[[ \"\$(systemctl show -p MainPID --value hcr-8880)\" != $P2 ]]"
-panel "1\n5\n3\ns\n\n0\n0\n"
+panel "1\n3\n5\ns\n\n0\n0\n0\n"
 check "deshabilitar HCR" bash -c '! systemctl is-enabled --quiet hcr-8880'
-panel "1\n4\n3\n\n0\n0\n"
+panel "1\n3\n4\n\n0\n0\n0\n"
 check "habilitar HCR" bash -c 'systemctl is-enabled --quiet hcr-8880 && systemctl is-active --quiet hcr-8880'
-check "servicio fuera de rango no hace nada" bash -c 'printf "1\n2\n7\n0\n0\n" | timeout 30 vpsarg >/dev/null 2>&1; systemctl is-active --quiet hcr-8880'
+check "protocolo u opción fuera de rango no hace nada" bash -c 'printf "1\n7\n3\n9\n0\n0\n0\n" | timeout 30 vpsarg >/dev/null 2>&1; systemctl is-active --quiet hcr-8880'
 
 echo "### Puertos"
-panel "2\n2\n8080\ns\n\n0\n0\n"
+panel "4\n2\n8080\ns\n\n0\n0\n"
 check "cambiar HCR a 8080" bash -c 'ss -Hltn "sport = :8080" | grep -q . && ! ss -Hltn "sport = :8880" | grep -q .'
 check "registro: puerto-hcr 8080 ok" journal_has "accion=puerto-hcr valor=8080 resultado=ok"
-panel "2\n2\n80\ns\n\n0\n0\n"
+panel "4\n2\n80\ns\n\n0\n0\n"
 check "HCR en 80 se rechaza y queda en 8080" bash -c 'grep -qx HCR_PORT=8080 /etc/vpsarg-hcr.conf && ss -Hltn "sport = :8080" | grep -q .'
 check "registro: el rechazo queda como error" journal_has "accion=puerto-hcr valor=80 resultado=error"
-panel "2\n2\n8880\ns\n\n0\n0\n"
+panel "4\n2\n8880\ns\n\n0\n0\n"
 check "HCR vuelve a 8880" listening 8880
-panel "2\n1\n2222\ns\n\n0\n0\n"
+panel "4\n1\n2222\ns\n\n0\n0\n"
 check "puerto-ssh 2222: PDirect-C" test "$(pd_port)" = 2222
 check "puerto-ssh 2222: HCR" test "$(hcr_arg -target)" = 127.0.0.1:2222
 check "puertos avisa que sshd no escucha en 2222 según su configuración" bash -c 'vpsarg puertos | grep -q "AVISO: PDirect-C apunta a 2222"'
-panel "2\n1\n22\ns\n\n0\n0\n"
+panel "4\n1\n22\ns\n\n0\n0\n"
 check "puerto-ssh 22: PDirect-C y HCR" bash -c "[[ \"\$(tr '\\0' '\\n' < /proc/\$(systemctl show -p MainPID --value pdirect-80)/cmdline | sed -n 2p)\" == 22 ]] && grep -qx HCR_SSH_PORT=22 /etc/vpsarg-hcr.conf"
 check "registro: puerto-ssh ok" journal_has "accion=puerto-ssh valor=22 resultado=ok"
 
 echo "### Diagnóstico"
-panel "5\n1\n\n2\n\n3\n\n5\n\n6\n\n0\n0\n"
-check "conexiones, recursos y SSH desde el menú" bash -c 'grep -q "CONEXIONES TCP ESTABLECIDAS" '"$OUT"' && grep -q "DESCRIPTORES" '"$OUT"' && grep -q "PasswordAuthentication" '"$OUT"''
+panel "3\n2\n\n3\n\n0\n4\n3\n\n4\n\n5\n\n0\n0\n"
+check "conexiones y recursos desde Estado; SSH desde Configuración" bash -c 'grep -q "CONEXIONES TCP ESTABLECIDAS" '"$OUT"' && grep -q "DESCRIPTORES" '"$OUT"' && grep -q "PasswordAuthentication" '"$OUT"''
 B="$(find /var/backups/vpsarg -maxdepth 1 -name '*-panel' | sort | tail -n 1)"
 check "copia de configuración creada" test -n "$B"
 check "la copia incluye confs y unidades" bash -c "for f in vpsarg-pdirect.conf vpsarg-hcr.conf vpsarg-servicios.conf pdirect-80.service udpgw-7300.service hcr-8880.service; do test -f '$B/'\$f || exit 1; done"
 check "la copia es privada (0700)" test "$(stat -c %a "$B")" = 700
 
 echo "### Desinstalar HCR desde el panel"
-panel "4\n2\ns\n\n0\n0\n"
+panel "1\n3\n8\ns\n\n0\n0\n0\n"
 check "desinstalar HCR" bash -c '! systemctl cat hcr-8880 >/dev/null 2>&1 && ! test -e /etc/vpsarg-hcr.conf'
 check "HCR NO INSTALADO otra vez" bash -c 'vpsarg estado | grep "^HCR" | grep -q "NO INSTALADO"'
 
