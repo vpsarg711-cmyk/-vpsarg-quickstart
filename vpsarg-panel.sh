@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # VPS ARG QuickStart - panel de administración (terminal)
 # Es un script interactivo: no deja ningún proceso en segundo plano.
-# Todas las acciones pasan por vpsarg-puertos, vpsarg-hcr y vpsarg-usuarios, que validan y revierten.
+# Todas las acciones pasan por vpsarg-puertos, vpsarg-hcr, vpsarg-bhttp y vpsarg-usuarios, que validan y revierten.
 # No modifica sshd ni /etc/ssh/sshd_config, el firewall, el código, los argumentos
 # ni el puerto de PDirect-C, ni la configuración o los límites de UDPGW.
 set -Euo pipefail
@@ -11,12 +11,14 @@ PDIRECT_CONF="/etc/vpsarg-pdirect.conf"
 HCR_CONF="/etc/vpsarg-hcr.conf"
 PUERTOS="/usr/local/sbin/vpsarg-puertos"
 HCR="/usr/local/sbin/vpsarg-hcr"
+BHTTP="/usr/local/sbin/vpsarg-bhttp"
+BHTTP_CONF="/etc/vpsarg-bhttp.conf"
 USUARIOS="/usr/local/sbin/vpsarg-usuarios"
 BACKUP_ROOT="/var/backups/vpsarg"
 LOG_TAG="vpsarg-panel"
-KNOWN_UNITS=(pdirect-80 udpgw-7300 hcr-8880)
-# Protocolos que muestra el panel. SSH es solo de lectura.
-PROTOCOLS=(pdirect-80 udpgw-7300 hcr-8880 ssh)
+KNOWN_UNITS=(pdirect-80 udpgw-7300 hcr-8880 bhttp-server bhttp-shim)
+# Protocolos que muestra el panel. SSH es solo de lectura. BHTTP son dos servicios (bhttp-server y bhttp-shim).
+PROTOCOLS=(pdirect-80 udpgw-7300 hcr-8880 bhttp ssh)
 USERS_GROUP="vpsarg-usuarios"
 # AUTO: cuentas que abren el panel al iniciar sesión y el disparador que lo hace.
 LIMITS_FILE="/etc/vpsarg/limites"
@@ -91,11 +93,17 @@ hcr_installed() {
   [[ -x "$HCR" && -r "$HCR_CONF" ]] && unit_exists hcr-8880
 }
 
+bhttp_installed() {
+  [[ -x "$BHTTP" && -r "$BHTTP_CONF" ]] && unit_exists bhttp-server && unit_exists bhttp-shim
+}
+
 service_name() {
   case "$1" in
     pdirect-80) echo "PDirect-C" ;;
     udpgw-7300) echo "BadVPN UDPGW" ;;
     hcr-8880) echo "HCR" ;;
+    bhttp-server) echo "BHTTP servidor" ;;
+    bhttp-shim) echo "BHTTP adaptador" ;;
     *) echo "$1" ;;
   esac
 }
@@ -105,6 +113,8 @@ service_port() {
     pdirect-80) echo 80 ;;
     udpgw-7300) echo 7300 ;;
     hcr-8880) conf_value "$HCR_CONF" HCR_PORT ;;
+    bhttp-server) conf_value "$BHTTP_CONF" BHTTP_INTERNAL_PORT ;;
+    bhttp-shim) conf_value "$BHTTP_CONF" BHTTP_PORT ;;
     *) return 1 ;;
   esac
 }
@@ -315,23 +325,45 @@ protocol_name() {
   case "$1" in
     ssh) echo "SSH" ;;
     udpgw-7300) echo "UDPGW" ;;
+    bhttp) echo "BHTTP" ;;
     *) service_name "$1" ;;
   esac
 }
 
+# BHTTP está ACTIVO solo si bhttp-server y bhttp-shim lo están; si no coinciden, ERROR.
+bhttp_state() {
+  local a b
+  bhttp_installed || { echo "NO INSTALADO"; return; }
+  a="$(service_state bhttp-server)"
+  b="$(service_state bhttp-shim)"
+  if [[ "$a" == "$b" ]]; then echo "$a"; else echo "ERROR"; fi
+}
+
 protocol_state() {
-  if [[ "$1" == ssh ]]; then ssh_state; else service_state "$1"; fi
+  case "$1" in
+    ssh) ssh_state ;;
+    bhttp) bhttp_state ;;
+    *) service_state "$1" ;;
+  esac
 }
 
 protocol_port() {
   local port
-  if [[ "$1" == ssh ]]; then port="$(ssh_listen_ports)"; else port="$(service_port "$1" 2>/dev/null || true)"; fi
+  case "$1" in
+    ssh) port="$(ssh_listen_ports)" ;;
+    bhttp) bhttp_installed && port="$(service_port bhttp-shim 2>/dev/null || true)" ;;
+    *) port="$(service_port "$1" 2>/dev/null || true)" ;;
+  esac
   echo "${port:--}"
 }
 
 protocol_pid() {
   local pid
-  if [[ "$1" == ssh ]]; then pid="$(unit_pid ssh)"; else pid="$(unit_pid "$1")"; fi
+  case "$1" in
+    ssh) pid="$(unit_pid ssh)" ;;
+    bhttp) pid="$(unit_pid bhttp-shim)" ;;
+    *) pid="$(unit_pid "$1")" ;;
+  esac
   echo "${pid:--}"
 }
 
@@ -477,6 +509,64 @@ menu_ficha_servicio() {
   done
 }
 
+menu_ficha_bhttp() {
+  local p
+  while true; do
+    ficha_header bhttp
+    if ! bhttp_installed; then
+      echo "Instalado:   no"
+      echo
+      echo "  1) Instalar   0) Volver"
+      ask "Opción: "
+      case "$REPLY" in
+        1)
+          echo "Se descargan los binarios de BHTTP verificados por sha256 (solo en una VPS ya instalada con token)."
+          confirm "¿Instalar BHTTP?" && run_logged "accion=instalar servicio=bhttp" "$BHTTP" instalar
+          pause
+          ;;
+        0|"") return ;;
+        *) echo "Opción inválida."; sleep 1 ;;
+      esac
+      continue
+    fi
+    echo "Estado:      $(paint_state "$(bhttp_state)")"
+    echo "Puerto:      TCP $(conf_value "$BHTTP_CONF" BHTTP_PORT) (bhttp-shim, PID $(protocol_pid bhttp))"
+    echo "Interno:     127.0.0.1:$(conf_value "$BHTTP_CONF" BHTTP_INTERNAL_PORT) (bhttp-server, PID $(unit_pid bhttp-server || true))"
+    echo "Destino:     127.0.0.1:$(conf_value "$BHTTP_CONF" BHTTP_SSH_PORT) (SSH)"
+    echo "Arranque:    $(systemctl is-enabled bhttp-server 2>/dev/null || echo desconocido) / $(systemctl is-enabled bhttp-shim 2>/dev/null || echo desconocido)"
+    echo "Conexiones TCP establecidas: $(conn_count "$(conf_value "$BHTTP_CONF" BHTTP_PORT)")"
+    echo
+    echo "  1) Activar (on)        2) Desactivar (off)    3) Reiniciar"
+    echo "  4) Cambiar el puerto   5) Ver registro        6) Recursos"
+    echo "  7) Desinstalar BHTTP   0) Volver"
+    ask "Opción: "
+    case "$REPLY" in
+      1) run_logged "accion=on servicio=bhttp" "$BHTTP" on; pause ;;
+      2) confirm "¿Desactivar BHTTP? Las conexiones abiertas se cortan y no arranca al reiniciar." \
+           && run_logged "accion=off servicio=bhttp" "$BHTTP" off; pause ;;
+      3) confirm "¿Reiniciar BHTTP? Las conexiones abiertas se cortan." \
+           && run_logged "accion=reiniciar servicio=bhttp" "$BHTTP" restart; pause ;;
+      4)
+        ask "Nuevo puerto de BHTTP (1024-65535, por ejemplo 8001): "
+        p="$REPLY"
+        if valid_port "$p"; then
+          confirm "¿Cambiar el puerto de BHTTP a $p? Los clientes deberán usar el nuevo puerto." \
+            && run_logged "accion=puerto-bhttp valor=$p" "$BHTTP" puerto "$p"
+        else
+          echo "Puerto no válido."
+        fi
+        pause
+        ;;
+      5) echo; "$BHTTP" logs 40; pause ;;
+      6) echo; "$BHTTP" recursos; pause ;;
+      7) confirm "¿Desinstalar BHTTP? No se tocan PDirect-C, UDPGW, HCR ni SSH." \
+           && run_logged "accion=desinstalar servicio=bhttp" "$BHTTP" desinstalar; pause ;;
+      0|"") return ;;
+      *) echo "Opción inválida."; sleep 1 ;;
+    esac
+  done
+}
+
 menu_ficha_ssh() {
   local pa ports
   while true; do
@@ -508,15 +598,16 @@ menu_protocolos() {
     banner
     echo "${B}PROTOCOLOS${N}"; echo
     show_protocolos; echo
-    echo "  1) PDirect-C   2) UDPGW   3) HCR   4) SSH"
-    echo "  5) Actualizar estados      0) Volver"
+    echo "  1) PDirect-C   2) UDPGW   3) HCR   4) BHTTP   5) SSH"
+    echo "  6) Actualizar estados      0) Volver"
     ask "Opción: "
     case "$REPLY" in
       1) menu_ficha_servicio pdirect-80 ;;
       2) menu_ficha_servicio udpgw-7300 ;;
       3) menu_ficha_servicio hcr-8880 ;;
-      4) menu_ficha_ssh ;;
-      5) ;;
+      4) menu_ficha_bhttp ;;
+      5) menu_ficha_ssh ;;
+      6) ;;
       0|"") return ;;
       *) echo "Opción inválida."; sleep 1 ;;
     esac
@@ -880,9 +971,10 @@ menu_usuarios() {
 make_backup() {
   local dir f files=()
   dir="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)-panel"
-  for f in "$PDIRECT_CONF" "$SERVICES_CONF" "$HCR_CONF" \
+  for f in "$PDIRECT_CONF" "$SERVICES_CONF" "$HCR_CONF" "$BHTTP_CONF" \
            /etc/systemd/system/pdirect-80.service /etc/systemd/system/udpgw-7300.service \
-           /etc/systemd/system/hcr-8880.service; do
+           /etc/systemd/system/hcr-8880.service /etc/systemd/system/bhttp-server.service \
+           /etc/systemd/system/bhttp-shim.service; do
     [[ -e "$f" ]] && files+=("$f")
   done
   install -d -m 0700 "$dir"

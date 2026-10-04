@@ -8,6 +8,8 @@ PDIRECT_SERVICE="pdirect-80"
 HCR_SERVICE="hcr-8880"
 HCR_CONF="/etc/vpsarg-hcr.conf"
 HCR_CTL="/usr/local/sbin/vpsarg-hcr"
+BHTTP_CONF="/etc/vpsarg-bhttp.conf"
+BHTTP_CTL="/usr/local/sbin/vpsarg-bhttp"
 DEFAULT_SERVICES=(pdirect-80 udpgw-7300)
 
 usage() {
@@ -24,12 +26,12 @@ Uso:
   sudo vpsarg-puertos puerto-ssh           (muestra el puerto SSH de destino)
   sudo vpsarg-puertos puerto-ssh PUERTO    (cambia el puerto SSH de destino)
 
-Servicios: pdirect-80 (TCP 80), udpgw-7300 (TCP 7300) y, si está instalado,
-hcr-8880 (puerto en /etc/vpsarg-hcr.conf).
+Servicios: pdirect-80 (TCP 80), udpgw-7300 (TCP 7300) y, si están instalados,
+hcr-8880 (puerto en /etc/vpsarg-hcr.conf), bhttp-server y bhttp-shim (/etc/vpsarg-bhttp.conf).
 Sin [servicio], la acción se aplica a todos los de /etc/vpsarg-servicios.conf.
 
-puerto-ssh solo cambia a qué puerto local 127.0.0.1 reenvían PDirect-C y HCR
-(si está instalado). Debe ser el puerto donde ya escucha SSH.
+puerto-ssh solo cambia a qué puerto local 127.0.0.1 reenvían PDirect-C, HCR y BHTTP
+(si están instalados). Debe ser el puerto donde ya escucha SSH.
 No modifica sshd, el puerto 80 ni el firewall.
 EOF
 }
@@ -123,6 +125,10 @@ show_status() {
     port="$(sed -n 's/^HCR_PORT=\([0-9]\{1,5\}\)$/\1/p' "$HCR_CONF" | tail -n 1)"
     [[ -n "$port" ]] && ports+=("$port")
   fi
+  if [[ -r "$BHTTP_CONF" ]]; then
+    port="$(sed -n 's/^BHTTP_PORT=\([0-9]\{1,5\}\)$/\1/p' "$BHTTP_CONF" | tail -n 1)"
+    [[ -n "$port" ]] && ports+=("$port")
+  fi
   for p in "${ports[@]}"; do
     filter+="${filter:+ or }sport = :$p"
   done
@@ -164,6 +170,14 @@ pdirect_running_port() {
 
 hcr_installed() {
   [[ -x "$HCR_CTL" && -r "$HCR_CONF" ]] && systemctl cat "$HCR_SERVICE" >/dev/null 2>&1
+}
+
+bhttp_installed() {
+  [[ -x "$BHTTP_CTL" && -r "$BHTTP_CONF" ]] && systemctl cat bhttp-server >/dev/null 2>&1
+}
+
+bhttp_ssh_port() {
+  sed -n 's/^BHTTP_SSH_PORT=\([0-9]\{1,5\}\)$/\1/p' "$BHTTP_CONF" | tail -n 1
 }
 
 hcr_ssh_port() {
@@ -220,17 +234,18 @@ rollback_pdirect() {
   fi
 }
 
-# Cambia el destino SSH de PDirect-C y, si está instalado, de HCR.
+# Cambia el destino SSH de PDirect-C y, si están instalados, de HCR y BHTTP.
 # No cambia el puerto de sshd: el nuevo valor debe ser donde ya escucha SSH.
 set_ssh_port() {
-  local new="$1" old hcr_old="" ssh_ok=0 pd_active=0
+  local new="$1" old hcr_old="" bh_old="" ssh_ok=0 pd_active=0
   valid_port "$new" || fail "Puerto no válido: $new (usá un número entre 1 y 65535)."
   systemctl cat "$PDIRECT_SERVICE" >/dev/null 2>&1 || fail "No existe la unidad $PDIRECT_SERVICE."
   old="$(ssh_port_current)"
   hcr_installed && hcr_old="$(hcr_ssh_port)"
+  bhttp_installed && bh_old="$(bhttp_ssh_port)"
 
-  if [[ "$new" == "$old" && ( -z "$hcr_old" || "$hcr_old" == "$new" ) ]]; then
-    echo "PDirect-C${hcr_old:+ y HCR} ya reenvía${hcr_old:+n} a 127.0.0.1:$new. Sin cambios."
+  if [[ "$new" == "$old" && ( -z "$hcr_old" || "$hcr_old" == "$new" ) && ( -z "$bh_old" || "$bh_old" == "$new" ) ]]; then
+    echo "PDirect-C${hcr_old:+, HCR}${bh_old:+, BHTTP} ya reenvía a 127.0.0.1:$new. Sin cambios."
     return 0
   fi
 
@@ -269,7 +284,16 @@ set_ssh_port() {
     fi
   fi
 
-  # 3) SSH sigue respondiendo en el puerto elegido.
+  # 3) BHTTP, si está instalado. vpsarg-bhttp restaura su propio valor si falla.
+  if [[ -n "$bh_old" && "$bh_old" != "$new" ]]; then
+    if ! "$BHTTP_CTL" destino-ssh "$new"; then
+      [[ -n "$hcr_old" && "$hcr_old" != "$new" ]] && { "$HCR_CTL" destino-ssh "$hcr_old" >/dev/null || true; }
+      [[ "$new" != "$old" ]] && rollback_pdirect "$old" "$pd_active"
+      fail "BHTTP no funcionó con el destino $new; se restauraron PDirect-C ($old), HCR (${hcr_old:-no instalado}) y BHTTP ($bh_old)."
+    fi
+  fi
+
+  # 4) SSH sigue respondiendo en el puerto elegido.
   if ((ssh_ok)) && ! ssh_banner "$new"; then
     echo "AVISO: SSH dejó de responder en 127.0.0.1:$new durante el cambio. Revisá: systemctl status ssh" >&2
   fi

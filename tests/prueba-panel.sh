@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Pruebas de laboratorio del panel vpsarg (Fase 2B y etapa 3A; los usuarios están en prueba-usuarios.sh).
-# SOLO para una máquina o contenedor de laboratorio con QuickStart instalado y HCR
-# sin instalar: inicia un sshd extra en 127.0.0.1:2222, instala y desinstala HCR
-# y maneja el menú enviándole respuestas por la entrada estándar.
+# SOLO para una máquina o contenedor de laboratorio con QuickStart instalado (con token):
+# inicia un sshd extra en 127.0.0.1:2222, desinstala HCR para probarlo desde el panel,
+# lo vuelve a instalar al final y maneja el menú enviándole respuestas por la entrada estándar.
 # No reinicia UDPGW ni toca sshd_config: ambos se verifican al final.
 # Uso: sudo bash tests/prueba-panel.sh /ruta/al/hcr-server
 # shellcheck disable=SC2016
@@ -22,9 +22,6 @@ hcr_arg() { tr '\0' '\n' < "/proc/$(pid_of hcr-8880)/cmdline" | grep -A1 -x -- "
 pd_port() { tr '\0' '\n' < "/proc/$(pid_of pdirect-80)/cmdline" | sed -n 2p; }
 # Maneja el menú: panel "respuestas separadas por \n". Termina cuando se acaba la entrada.
 panel() { printf "%b" "$1" | timeout 60 vpsarg > "$OUT" 2>&1; }
-# Tokens de laboratorio (instalar HCR exige uno nuevo con HCR): el arnés del contenedor
-# indica el emisor y la clave de prueba en VPSARG_LAB_EMISOR y VPSARG_LAB_CLAVE.
-lab_token() { bash "${VPSARG_LAB_EMISOR:?}" emitir "${VPSARG_LAB_CLAVE:?}" "$1-$$" "$(date -u +%F)" base,hcr; }
 has() { grep -q -- "$1" "$OUT"; }
 state_line() { vpsarg estado | grep -- "$1" | awk '{print $2, $3}'; }
 journal_has() { journalctl -t vpsarg-panel -o cat | grep -q -- "$1"; }
@@ -38,6 +35,8 @@ sums() {
 echo "### Preparación"
 install -d -m 0755 /opt/hcr
 install -o root -g root -m 0755 "$SRC" /opt/hcr/hcr-server
+# install.sh instala HCR siempre: se quita para probar instalarlo desde el panel.
+vpsarg-hcr desinstalar >/dev/null
 mkdir -p /run/sshd
 /usr/sbin/sshd -p 2222 -o PidFile=/run/sshd-2222.pid
 sleep 1
@@ -72,13 +71,13 @@ check "el menú termina al cerrarse la entrada" bash -c 'printf "" | timeout 10 
 echo "### Menú principal, Protocolos y Estado (etapa 3A)"
 panel "0\n"
 check "menú principal: 4 secciones" bash -c 'for s in "[ 1 ] PROTOCOLOS" "[ 2 ] USUARIOS" "[ 3 ] ESTADO" "[ 4 ] CONFIGURACIÓN" "[ 0 ] SALIR"; do grep -qF "$s" '"$OUT"' || exit 1; done'
-check "menú principal: línea de estado con los 4 protocolos" bash -c 'grep -q "PDirect-C ● ACTIVO.*UDPGW ● ACTIVO.*HCR ○ NO INSTALADO.*SSH ● ACTIVO" '"$OUT"''
+check "menú principal: línea de estado con los 5 protocolos" bash -c 'grep -q "PDirect-C ● ACTIVO.*UDPGW ● ACTIVO.*HCR ○ NO INSTALADO.*BHTTP ● ACTIVO.*SSH ● ACTIVO" '"$OUT"''
 check "protocolos: PDirect-C ACTIVO, puerto 80 y su PID" bash -c 'vpsarg protocolos | grep -qE "^PDirect-C +ACTIVO +80 +$(systemctl show -p MainPID --value pdirect-80)$"'
 check "protocolos: UDPGW ACTIVO, puerto 7300 y su PID" bash -c 'vpsarg protocolos | grep -qE "^UDPGW +ACTIVO +7300 +$(systemctl show -p MainPID --value udpgw-7300)$"'
 check "protocolos: HCR NO INSTALADO sin puerto ni PID" bash -c 'vpsarg protocolos | grep -qE "^HCR +NO INSTALADO +- +-$"'
 check "protocolos: SSH ACTIVO en 22" bash -c 'vpsarg protocolos | grep -qE "^SSH +ACTIVO +22 +"'
 SSHD_PID0="$(pid_of ssh)"
-panel "1\n4\n9\n2\n\n1\n\n0\n0\n0\n"
+panel "1\n5\n9\n2\n\n1\n\n0\n0\n0\n"
 check "ficha SSH: es solo de lectura" has "SSH es solo de lectura"
 check "ficha SSH: no ofrece detener ni reiniciar" bash -c '! sed -n "/PROTOCOLOS › SSH/,\$p" '"$OUT"' | grep -q "Detener\|Reiniciar"'
 check "ficha SSH: opción inválida rechazada" has "Opción inválida"
@@ -89,7 +88,7 @@ check "ficha UDPGW: PID y reinicios" bash -c 'grep -q "^PID: *$(systemctl show -
 check "ficha UDPGW: errores recientes" has "Últimas advertencias o errores:"
 panel "1\n1\n\n0\n0\n"
 check "ficha PDirect-C: destino SSH" has "Destino: *127.0.0.1:22 (SSH)"
-panel "1\n5\n0\n0\n"
+panel "1\n6\n0\n0\n"
 check "Actualizar estados vuelve a mostrar la tabla" test "$(grep -c "^PROTOCOLO *ESTADO *PUERTO *PID" "$OUT")" = 2
 check "sistema: CPU, carga, RAM, swap, disco, uptime y temperatura" bash -c 'o="$(vpsarg sistema)"; for k in "CPU:" "CARGA:" "RAM:" "SWAP:" "DISCO /:" "UPTIME:" "TEMP:"; do grep -q "^$k" <<<"$o" || exit 1; done'
 check "sistema: CPU en porcentaje" bash -c 'vpsarg sistema | grep -qE "^CPU: +[0-9]+ % \([0-9]+ núcleos\)$"'
@@ -111,7 +110,7 @@ echo "### HCR desde el panel"
 panel "1\n3\n1\nn\n\n0\n0\n0\n"
 check "responder n no instala" bash -c '! systemctl cat hcr-8880 >/dev/null 2>&1'
 check "la ficha de HCR avisa que no está validado para producción" has "no está validado para producción"
-VPSARG_TOKEN="$(lab_token prueba-panel-1)" panel "1\n3\n1\ns\n\n0\n0\n0\n"
+panel "1\n3\n1\ns\n\n0\n0\n0\n"
 check "instalar HCR" systemctl is-active --quiet hcr-8880
 check "HCR ACTIVO en 8880" test "$(state_line '^HCR')" = "ACTIVO 8880"
 check "registro: instalar ok" journal_has "accion=instalar servicio=hcr-8880 resultado=ok"
@@ -167,6 +166,7 @@ echo "### Desinstalar HCR desde el panel"
 panel "1\n3\n8\ns\n\n0\n0\n0\n"
 check "desinstalar HCR" bash -c '! systemctl cat hcr-8880 >/dev/null 2>&1 && ! test -e /etc/vpsarg-hcr.conf'
 check "HCR NO INSTALADO otra vez" bash -c 'vpsarg estado | grep "^HCR" | grep -q "NO INSTALADO"'
+check "volver a instalar HCR (instalación completa, como la dejó install.sh)" bash -c 'vpsarg-hcr instalar >/dev/null && systemctl is-active --quiet hcr-8880'
 
 echo "### Lo que no debe cambiar"
 check "UDPGW no se reinició (PID $UG_PID0)" test "$(pid_of udpgw-7300)" = "$UG_PID0"

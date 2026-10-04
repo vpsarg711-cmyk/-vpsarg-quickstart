@@ -1,209 +1,244 @@
 #!/usr/bin/env bash
-# Pruebas del token de instalación (install.sh y vpsarg-hcr instalar).
-# SOLO para un contenedor de laboratorio con QuickStart ya instalado y el binario HCR
-# en /opt/hcr/hcr-server: genera una clave de prueba, la pone en una COPIA del
-# verificador, oculta openssl un momento, instala y desinstala HCR y reinstala
-# QuickStart (reinicia PDirect-C y UDPGW). NUNCA en una VPS real.
+# Pruebas del token único y del instalador completo (install.sh con el servicio de autorización).
+# SOLO para un contenedor de laboratorio LIMPIO (sin QuickStart), con:
+#   - el servicio de autorización de laboratorio en VPSARG_LAB_AUTH_URL (http://127.0.0.1:PUERTO)
+#     y su línea de comandos en lab-auth (vpsarg-autorizacion.py --db ...);
+#   - el binario HCR en /opt/hcr/hcr-server y los binarios de BHTTP en VPSARG_LAB_BHTTP_DIR.
+# Rechaza tokens, provoca faltantes, conflictos y fallos a mitad de la instalación, comprueba
+# la reversión y termina con una instalación completa. NUNCA en una VPS real.
 # Uso: sudo bash tests/prueba-token.sh /ruta/al/repo
 # shellcheck disable=SC2016
 set -uo pipefail
 
 REPO="${1:?Uso: sudo bash tests/prueba-token.sh /ruta/al/repo}"
-# systemd 245 (Ubuntu 20.04) no detecta Docker anidado: también vale /.dockerenv.
-[[ "$(systemd-detect-virt 2>/dev/null)" == docker || -f /.dockerenv ]] || { echo "Solo en el contenedor de laboratorio." >&2; exit 1; }
+[[ -e /.dockerenv ]] || { echo "Solo en el contenedor de laboratorio." >&2; exit 1; }
+: "${VPSARG_LAB_AUTH_URL:?}" "${VPSARG_LAB_BHTTP_DIR:?}"
+command -v lab-auth >/dev/null || { echo "Falta lab-auth." >&2; exit 1; }
 W=/tmp/prueba-token
 rm -rf "$W"; mkdir -p "$W/src"
-cp "$REPO"/{install.sh,pdirect.c,vpsarg-puertos.sh,vpsarg-hcr.sh,vpsarg-panel.sh,vpsarg-usuarios.sh,vpsarg-token.sh} "$W/src/"
-EMIT="$REPO/herramientas/emitir-token.sh"
-USED=/etc/vpsarg/tokens-usados
+FILES=(install.sh pdirect.c vpsarg-puertos.sh vpsarg-hcr.sh vpsarg-bhttp.sh vpsarg-panel.sh vpsarg-usuarios.sh vpsarg-token.sh)
+for f in "${FILES[@]}"; do cp "$REPO/$f" "$W/src/"; done
+export VPSARG_SRC_DIR="$W/src"
 PASS=0
 FAILS=0
 ok()   { echo "PASA  $*"; PASS=$((PASS + 1)); }
 bad()  { echo "FALLA $*"; FAILS=$((FAILS + 1)); }
 check() { local d="$1"; shift; if "$@"; then ok "$d"; else bad "$d"; fi; }
-pid_of() { systemctl show -p MainPID --value "$1"; }
-b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
-hcr_absent() { ! systemctl cat hcr-8880 >/dev/null 2>&1 && ! test -e /etc/vpsarg-hcr.conf && ! test -e /usr/local/lib/vpsarg/hcr-server; }
-tok() { bash "$EMIT" emitir "$KEY" "$1" "${3:-$TODAY}" "$2"; }   # tok ID ALCANCE [VENCE]
+listening() { [[ -n "$(ss -Hltn "sport = :$1")" ]]; }
+export -f listening
+UNITS=(pdirect-80 udpgw-7300 hcr-8880 bhttp-server bhttp-shim)
+# new_token: emite un token de laboratorio; deja el token en T y su id en ID.
+new_token() {
+  local out
+  out="$(lab-auth emitir --nota prueba 2>&1)"
+  T="$(tail -n 1 <<<"$out")"
+  ID="$(sed -n 's/^ID: \([^ ]*\) .*/\1/p' <<<"$out")"
+}
+db_state() { lab-auth ver "$1" | awk '$1=="estado"{print $2}'; }
+# Cambios directos en la base del servicio de laboratorio (para preparar casos).
+db_exec() { python3 -c 'import sqlite3,sys; c=sqlite3.connect("/root/lab-auth.db"); c.execute(sys.argv[1], sys.argv[2:]); c.commit()' "$@"; }
 
-# Todo lo que una corrida rechazada no debe cambiar.
+# Todo lo que una corrida rechazada o revertida no debe cambiar (sin contar paquetes apt).
 state() {
-  sha256sum /etc/systemd/system/pdirect-80.service /etc/systemd/system/udpgw-7300.service \
-    /usr/local/bin/pdirect-c /opt/badvpn/badvpn-udpgw /etc/vpsarg-pdirect.conf /etc/vpsarg-servicios.conf \
-    /usr/local/sbin/vpsarg-puertos /usr/local/lib/vpsarg/token.sh 2>&1
-  echo "pdirect PID=$(pid_of pdirect-80) udpgw PID=$(pid_of udpgw-7300)"
-  echo "hcr: unidad=$(systemctl cat hcr-8880 >/dev/null 2>&1 && echo sí || echo no) conf=$(sha256sum /etc/vpsarg-hcr.conf 2>/dev/null | cut -c1-16) bin=$(test -e /usr/local/lib/vpsarg/hcr-server && echo sí || echo no) activo=$(systemctl is-active hcr-8880)"
-  echo "tokens usados: $(sha256sum "$USED" 2>/dev/null | cut -c1-16)"
-  echo "paquetes: $(dpkg-query -W -f '${Package} ${Version}\n' | sha256sum | cut -c1-16)"
-  echo "apt listas: $(find /var/lib/apt/lists -maxdepth 1 -type f -newer "$W/marca" | wc -l)"
+  local f u
+  for f in /usr/local/bin/pdirect-c /etc/vpsarg-pdirect.conf /opt/badvpn/badvpn-udpgw /usr/local/sbin/vpsarg-puertos \
+           /usr/local/sbin/vpsarg-hcr /usr/local/sbin/vpsarg-bhttp /usr/local/sbin/vpsarg /usr/local/sbin/vpsarg-usuarios \
+           /etc/vpsarg-servicios.conf /etc/vpsarg-hcr.conf /usr/local/lib/vpsarg/hcr-server /etc/vpsarg-bhttp.conf \
+           /usr/local/lib/vpsarg/bhttp-server /usr/local/lib/vpsarg/bhttp-shim /etc/vpsarg/instalacion \
+           /etc/systemd/system/{pdirect-80,udpgw-7300,hcr-8880,bhttp-server,bhttp-shim}.service; do
+    if [[ -e "$f" ]]; then echo "$f $(sha256sum < "$f" | cut -c1-16)"; else echo "$f no existe"; fi
+  done
+  for u in "${UNITS[@]}"; do
+    echo "$u $(systemctl is-active "$u" 2>/dev/null) $(systemctl is-enabled "$u" 2>/dev/null)"
+  done
+  for f in /opt/badvpn /usr/local/lib/vpsarg /etc/vpsarg; do [[ -d "$f" ]] && echo "carpeta $f"; done
+  echo "escuchan: $(for p in 80 7300 8880 8001 18022; do listening "$p" && printf '%s ' "$p"; done)"
   echo "temporales: $(find /tmp -maxdepth 1 -name 'tmp.*' -newer "$W/marca" | wc -l)"
-  echo "copias: $(find /var/backups/vpsarg -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)"
+  echo "marca de instalación en curso: $(test -e /run/vpsarg-instalacion && echo sí || echo no)"
 }
 
-# Firma un contenido arbitrario con la clave KEY (para armar tokens a medida).
-sign_raw() {
-  local payload
-  payload="$(printf '%s' "$1" | b64url)"
-  echo "vpsarg1.$payload.$(printf 'vpsarg1.%s' "$payload" | openssl dgst -sha256 -sign "$KEY" | b64url)"
+# install_run NOMBRE TOKEN [RESPUESTAS] [SCRIPT]: corre install.sh. Con RESPUESTAS usa una terminal
+# (script) y escribe esas respuestas; sin RESPUESTAS corre sin terminal (valores por defecto).
+install_run() {
+  local name="$1" token="$2" answers="${3:-}" script="${4:-$W/src/install.sh}"
+  if [[ -n "$answers" ]]; then
+    # script no siempre devuelve el código del hijo cuando la entrada termina antes: se toma del log.
+    VPSARG_TOKEN="$token" VPSARG_SRC_DIR="${script%/*}" script -qec "bash $script; echo \"__rc=\$?\"" /dev/null \
+      < <(printf '%b' "$answers") > "$W/$name.log" 2>&1
+    RC="$(sed -n 's/^__rc=\([0-9]*\).*/\1/p' "$W/$name.log" | tail -n 1)"
+    RC="${RC:-99}"
+  else
+    VPSARG_TOKEN="$token" VPSARG_SRC_DIR="${script%/*}" setsid -w bash "$script" </dev/null > "$W/$name.log" 2>&1
+    RC=$?
+  fi
 }
 
-# assert_rejected NOMBRE MENSAJE: la última corrida se detuvo sin cambios.
-assert_rejected() {
-  local name="$1" msg="$2"
+# rejected NOMBRE MENSAJE TOKEN [RESPUESTAS] [SCRIPT]: se detiene antes de cambiar nada.
+rejected() {
+  local name="$1" msg="$2" token="$3" before
+  before="$(state)"
+  install_run "$name" "$token" "${4:-}" "${5:-$W/src/install.sh}"
   check "$name: se detiene (rc=$RC)" test "$RC" -ne 0
   check "$name: dice \"$msg\"" grep -qF -- "$msg" "$W/$name.log"
-  check "$name: dice que no se realizaron cambios" grep -q "No se realizaron cambios" "$W/$name.log"
-  check "$name: sin cambios (archivos, servicios, HCR, apt, tokens usados)" diff <(echo "$BEFORE") <(state)
-}
-# install.sh sin terminal (con VPSARG_TOKEN).
-rejected() {
-  local name="$1" msg="$2" token="$3" script="${4:-$W/src/install.sh}"
-  BEFORE="$(state)"
-  VPSARG_TOKEN="$token" VPSARG_SRC_DIR="${script%/*}" setsid -w bash "$script" </dev/null > "$W/$name.log" 2>&1
-  RC=$?
-  assert_rejected "$name" "$msg"
-}
-# install.sh con terminal (responde SI a sobrescribir y Enter al puerto): para rechazos posteriores a esas preguntas.
-rejected_tty() {
-  local name="$1" msg="$2" token="$3"
-  BEFORE="$(state)"
-  install_tty "$name" "$token"
-  assert_rejected "$name" "$msg"
-}
-# vpsarg-hcr instalar sin terminal (con VPSARG_TOKEN).
-hcr_rejected() {
-  local name="$1" msg="$2" token="$3"
-  BEFORE="$(state)"
-  VPSARG_TOKEN="$token" setsid -w vpsarg-hcr instalar </dev/null > "$W/$name.log" 2>&1
-  RC=$?
-  assert_rejected "$name" "$msg"
-}
-# install.sh con terminal: responde SI a sobrescribir y Enter al puerto SSH.
-install_tty() {
-  local name="$1" token="$2"
-  # script no siempre devuelve el código del hijo cuando la entrada termina antes: se toma del log.
-  VPSARG_TOKEN="$token" VPSARG_SRC_DIR="$W/src" script -qec "bash $W/src/install.sh; echo \"__rc=\$?\"" /dev/null \
-    < <(printf 'SI\n\n') > "$W/$name.log" 2>&1
-  RC="$(sed -n 's/^__rc=\([0-9]*\).*/\1/p' "$W/$name.log" | tail -n 1)"
-  RC="${RC:-99}"
+  check "$name: sin cambios (archivos, servicios, puertos, temporales)" diff <(echo "$before") <(state)
 }
 
-echo "### Preparación (contenedor)"
+# aborted NOMBRE MENSAJE [RESPUESTAS]: con token válido falta algo obligatorio;
+# nada cambia y el token queda disponible.
+aborted() {
+  local name="$1" msg="$2" answers="${3:-}" tok id
+  new_token; tok="$T"; id="$ID"
+  rejected "$name" "$msg" "$tok" "$answers"
+  check "$name: dice que no hubo cambios" grep -qE "Instalación abortada sin cambios|No se realizaron cambios|No se instaló ningún componente" "$W/$name.log"
+  check "$name: el token no se consumió y quedó disponible" test "$(db_state "$id")" = emitido
+}
+
+echo "### Preparación (contenedor limpio)"
 touch "$W/marca"; sleep 1
-check "bash -n install.sh, vpsarg-token.sh, vpsarg-hcr.sh, emitir-token.sh" \
-  bash -c 'for f; do bash -n "$f" || exit 1; done' _ "$W/src/install.sh" "$W/src/vpsarg-token.sh" "$W/src/vpsarg-hcr.sh" "$EMIT"
-bash "$EMIT" clave "$W/clave" > "$W/clave.out" 2>&1
-check "clave privada 0600" test "$(stat -c %a "$W/clave/vpsarg-token-privada.pem")" = 600
-check "emitir-token no sobrescribe una clave existente" bash -c '! bash "$1" clave "$2" >/dev/null 2>&1' _ "$EMIT" "$W/clave"
-bash "$EMIT" clave "$W/otra" >/dev/null 2>&1
-KEY="$W/clave/vpsarg-token-privada.pem"
-PUB="$(sed -n '/BEGIN PUBLIC KEY/,/END PUBLIC KEY/p' "$W/clave.out")"
-python3 - "$W/src/vpsarg-token.sh" "$PUB" <<'PY'
-import sys
-p, pub = sys.argv[1], sys.argv[2]
-s = open(p).read()
-assert s.count('VPSARG_TOKEN_PUBKEY=""\n') == 1
-open(p, 'w').write(s.replace('VPSARG_TOKEN_PUBKEY=""\n', 'VPSARG_TOKEN_PUBKEY="' + pub + '"\n'))
-PY
-mkdir -p "$W/sin-clave"; cp "$W/src/"* "$W/sin-clave/"; cp "$REPO/vpsarg-token.sh" "$W/sin-clave/"
-TODAY="$(date -u +%F)"
-YESTERDAY="$(date -u -d yesterday +%F)"
-check "emitir: token con formato vpsarg1.datos.firma" bash -c '[[ "$1" =~ ^vpsarg1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]' _ "$(tok emitido base)"
-check "emitir: rechaza fecha inválida" bash -c '! bash "$1" emitir "$2" x 2030-02-30 base >/dev/null 2>&1' _ "$EMIT" "$KEY"
-check "emitir: rechaza id inválido" bash -c '! bash "$1" emitir "$2" "a b" 2030-01-01 base >/dev/null 2>&1' _ "$EMIT" "$KEY"
-check "emitir: rechaza alcance inválido" bash -c '! bash "$1" emitir "$2" x 2030-01-01 todo >/dev/null 2>&1' _ "$EMIT" "$KEY"
-check "QuickStart activo y binario HCR disponible" bash -c 'systemctl is-active --quiet pdirect-80 udpgw-7300 && test -f /opt/hcr/hcr-server'
-vpsarg-hcr desinstalar >/dev/null 2>&1
-check "HCR desinstalado para empezar" hcr_absent
-rm -f "$USED"
+check "sin QuickStart instalado" bash -c '! systemctl cat pdirect-80 >/dev/null 2>&1 && ! test -e /usr/local/sbin/vpsarg'
+check "servicio de autorización de laboratorio responde" bash -c 'curl -fsS "$VPSARG_LAB_AUTH_URL/v1/salud" | grep -q true'
+check "bash -n de los scripts" bash -c 'for f in "$@"; do [[ "$f" == *.sh ]] && { bash -n "$f" || exit 1; }; done; exit 0' _ "${FILES[@]/#/$W/src/}"
+CLEAN="$(state)"
 
-echo "### install.sh: tokens rechazados antes de cualquier cambio"
+echo "### Token rechazado antes de cualquier cambio"
 rejected sin-token "Falta el token de instalación" ""
 rejected formato "no tiene un formato válido" "no-es-un-token"
-rejected largo "no tiene un formato válido" "vpsarg1.$(head -c 1100 /dev/zero | tr '\0' A).AAAA"
-rejected otra-clave "La firma del token no es válida" "$(bash "$EMIT" emitir "$W/otra/vpsarg-token-privada.pem" lab-001 "$TODAY" base)"
-rejected vencido "venció el $YESTERDAY" "$(tok lab-001 base "$YESTERDAY")"
-GOOD="$(tok lab-001 base)"
-ALT="$(printf 'id=lab-999\nvence=%s\nalcance=base,hcr' "$TODAY" | b64url)"
-rejected alterado "La firma del token no es válida" "vpsarg1.$ALT.${GOOD##*.}"
-rejected firma-cortada "La firma del token no es válida" "${GOOD%?????}"
-rejected dato-desconocido "datos desconocidos" "$(sign_raw "id=lab-001"$'\n'"vence=$TODAY"$'\n'"admin=1")"
-rejected sin-vencimiento "fecha de vencimiento válida" "$(sign_raw "id=lab-001")"
-rejected fecha-invalida "fecha de vencimiento válida" "$(sign_raw "id=lab-001"$'\n'"vence=2030-13-01")"
-rejected id-invalido "no tiene un id válido" "$(sign_raw "id=a;b"$'\n'"vence=$TODAY")"
-rejected nota-invalida "nota no válida" "$(sign_raw "id=lab-001"$'\n'"vence=$TODAY"$'\n'"nota=\$(id)")"
-rejected alcance-invalido "alcance no válido" "$(sign_raw "id=lab-001"$'\n'"vence=$TODAY"$'\n'"alcance=todo")"
-rejected sin-clave-publica "no tiene configurada la clave pública" "$GOOD" "$W/sin-clave/install.sh"
-mv /usr/bin/openssl /usr/bin/openssl.oculto
-rejected sin-openssl "Falta openssl" "$GOOD"
-mv /usr/bin/openssl.oculto /usr/bin/openssl
-check "openssl restaurado" command -v openssl
+rejected inexistente "El token no es válido" "vpsarg_$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=' | cut -c1-43)"
+new_token; lab-auth revocar "$ID" >/dev/null
+rejected revocado "El token fue revocado" "$T"
+new_token; db_exec "UPDATE tokens SET vence=? WHERE id=?" "$(date -u -d yesterday +%F)" "$ID"
+rejected vencido "El token venció" "$T"
+new_token
+curl -fsS -H 'Content-Type: application/json' --data-binary "{\"token\":\"$T\",\"hostname\":\"otra-vps\"}" "$VPSARG_LAB_AUTH_URL/v1/reservar" >/dev/null
+rejected en-uso "reservado por otra instalación en curso" "$T"
+check "en-uso: la reserva de la otra VPS sigue" test "$(db_state "$ID")" = reservado
+new_token
+VPSARG_LAB_AUTH_URL=http://127.0.0.1:1 rejected servicio-caido "No se pudo contactar el servicio de autorización" "$T"
+VPSARG_LAB_AUTH_URL="" rejected sin-servicio "no tiene configurado el servicio de autorización" "$T"
+VPSARG_LAB_AUTH_URL=http://servidor.ejemplo rejected sin-https "debe usar https" "$T"
+check "esos 3 rechazos no tocaron el token" test "$(db_state "$ID")" = emitido
+
+echo "### Falta un componente obligatorio: se detiene antes de cambiar nada y libera el token"
 mv /opt/hcr/hcr-server /opt/hcr/hcr-server.oculto
-rejected hcr-sin-binario "El token incluye HCR pero falta /opt/hcr/hcr-server" "$(tok lab-hcr-1 base,hcr)"
+aborted hcr-falta "HCR requerido pero no disponible"
 mv /opt/hcr/hcr-server.oculto /opt/hcr/hcr-server
 cp -p /opt/hcr/hcr-server "$W/hcr-original"; printf x >> /opt/hcr/hcr-server
-rejected_tty hcr-binario-distinto "sha256 de /opt/hcr/hcr-server no coincide" "$(tok lab-hcr-1 base,hcr)"
+aborted hcr-modificado "sha256 de /opt/hcr/hcr-server no coincide"
 cp -p "$W/hcr-original" /opt/hcr/hcr-server
+check "HCR restaurado" cmp -s /opt/hcr/hcr-server "$W/hcr-original"
+mkdir -p "$W/bh-falta" "$W/bh-mod"
+cp -p "$VPSARG_LAB_BHTTP_DIR/bhttp-server" "$W/bh-falta/"
+cp -p "$VPSARG_LAB_BHTTP_DIR/bhttp-server" "$VPSARG_LAB_BHTTP_DIR/bhttp-shim" "$W/bh-mod/"; printf x >> "$W/bh-mod/bhttp-server"
+VPSARG_LAB_BHTTP_DIR="$W/bh-falta" aborted bhttp-falta "BHTTP requerido pero falta bhttp-shim"
+VPSARG_LAB_BHTTP_DIR="$W/bh-mod" aborted bhttp-modificado "El sha256 de bhttp-server no coincide"
+python3 -m http.server 8001 --bind 0.0.0.0 >/dev/null 2>&1 & WEB=$!
+for _ in $(seq 20); do listening 8001 && break; sleep 0.3; done
+aborted bhttp-puerto-ocupado "El puerto TCP 8001 ya está en uso por otro programa"
+check "bhttp-puerto-ocupado: no detuvo el programa del 8001" kill -0 "$WEB"
+kill "$WEB"; wait "$WEB" 2>/dev/null
+python3 -m http.server 8880 --bind 0.0.0.0 >/dev/null 2>&1 & WEB=$!
+for _ in $(seq 20); do listening 8880 && break; sleep 0.3; done
+aborted hcr-puerto-ocupado "El puerto TCP 8880 ya está en uso por otro programa"
+kill "$WEB"; wait "$WEB" 2>/dev/null
+aborted bhttp-mismo-puerto-que-hcr "ya es el de HCR" '\n8880\n'
+aborted bhttp-puerto-reservado "ya lo usa otro protocolo" '\n7300\n'
+aborted cancelar "Cancelado" '2299\nn\n'
 
-echo "### install.sh con token solo base (escrito en la terminal, sin eco)"
-BASE_UNITS="$(sha256sum /etc/systemd/system/pdirect-80.service /etc/systemd/system/udpgw-7300.service /usr/local/bin/pdirect-c /etc/vpsarg-pdirect.conf)"
+echo "### Fallo de la compilación: no queda nada instalado y el token vuelve a estar disponible"
+mkdir -p "$W/falso"; printf '#!/bin/sh\necho "cmake de prueba: falla" >&2\nexit 1\n' > "$W/falso/cmake"; chmod 0755 "$W/falso/cmake"
+PATH="$W/falso:$PATH" aborted compilacion "falló el paso: compilar BadVPN UDPGW. No se instaló ningún componente de VPS ARG"
+
+echo "### Fallo a mitad de la instalación (sistema limpio): se revierte todo"
+mkdir -p "$W/falla-bhttp"; cp "$W/src/"* "$W/falla-bhttp/"
+python3 - "$W/falla-bhttp/vpsarg-bhttp.sh" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+a = "cmd_instalar() {\n  require_authorized\n"
+assert a in s
+open(p, "w").write(s.replace(a, a + '  fail "falla de prueba en la instalación de BHTTP"\n'))
+PY
+new_token
+install_run falla-limpio "$T" "" "$W/falla-bhttp/install.sh"
+check "falla-limpio: termina con error (rc=$RC)" test "$RC" -ne 0
+check "falla-limpio: informa el paso que falló" grep -q "falló la instalación en el paso: instalar BHTTP" "$W/falla-limpio.log"
+check "falla-limpio: informa la reversión completa" grep -q "Reversión completa" "$W/falla-limpio.log"
+check "falla-limpio: el sistema quedó como antes (nada de VPS ARG instalado)" diff <(echo "$CLEAN") <(state)
+check "falla-limpio: ningún puerto de VPS ARG abierto" \
+  bash -c '[[ -z "$(ss -Hltn "( sport = :80 or sport = :7300 or sport = :8880 or sport = :8001 or sport = :18022 )")" ]]'
+check "falla-limpio: el token no se consumió y quedó disponible" test "$(db_state "$ID")" = emitido
+
+echo "### Instalación completa con el token (escrito en la terminal, sin eco)"
+new_token
 ( while sleep 0.2; do ps -eo args; done > "$W/ps.txt" 2>/dev/null ) &
 PSMON=$!
-# El token se escribe recién cuando aparece el pedido (como una persona), y después SI y Enter.
-( sleep 3; printf '%s\n' "$GOOD"; sleep 2; printf 'SI\n\n' ) | VPSARG_SRC_DIR="$W/src" script -qec "bash $W/src/install.sh; echo \"__rc=\$?\"" /dev/null > "$W/base.log" 2>&1
-RC="$(sed -n 's/^__rc=\([0-9]*\).*/\1/p' "$W/base.log" | tail -n 1)"
+( sleep 3; printf '%s\n' "$T"; sleep 2; printf '\n\n' ) | script -qec "bash $W/src/install.sh; echo \"__rc=\$?\"" /dev/null > "$W/completa.log" 2>&1
+RC="$(sed -n 's/^__rc=\([0-9]*\).*/\1/p' "$W/completa.log" | tail -n 1)"
 kill "$PSMON" 2>/dev/null; wait "$PSMON" 2>/dev/null
-check "token base: instalación rc=0 (rc=$RC)" test "$RC" = 0
-check "informa el token válido con su alcance" bash -c 'grep -q "Token válido: lab-001, alcance base, vence el $1" "$2"' _ "$TODAY" "$W/base.log"
-check "el token no aparece en la salida (lectura sin eco)" bash -c '! grep -qF -- "${1#vpsarg1.}" "$2"' _ "$GOOD" "$W/base.log"
-check "el token no aparece en la lista de procesos durante la instalación" bash -c '! grep -qF -- "${1#vpsarg1.}" "$2"' _ "$GOOD" "$W/ps.txt"
-check "PDirect-C y UDPGW activos" systemctl is-active --quiet pdirect-80 udpgw-7300
-check "unidades, binario de PDirect-C y destino iguales a los de antes" diff <(echo "$BASE_UNITS") <(sha256sum /etc/systemd/system/pdirect-80.service /etc/systemd/system/udpgw-7300.service /usr/local/bin/pdirect-c /etc/vpsarg-pdirect.conf)
-check "token base: HCR NO se instala" hcr_absent
-check "verificador instalado en /usr/local/lib/vpsarg/token.sh" test -r /usr/local/lib/vpsarg/token.sh
-check "tokens usados: 0600 y con el id (sin el token)" bash -c '[[ "$(stat -c %a "$1")" == 600 ]] && grep -q "^id=lab-001 uso=base vence=$2 " "$1" && ! grep -qF "${3#vpsarg1.}" "$1"' _ "$USED" "$TODAY" "$GOOD"
-check "registro en el journal con el id" bash -c 'journalctl -t vpsarg-instalador -o cat | grep -q "token_id=lab-001 uso=base"'
-rejected reusar-base "El token lab-001 ya se usó en esta VPS" "$GOOD"
+check "instalación completa rc=0 (rc=${RC:-?})" test "${RC:-99}" = 0
+for u in "${UNITS[@]}"; do
+  check "$u activo y habilitado" bash -c "systemctl is-active --quiet $u && systemctl is-enabled --quiet $u"
+done
+for p in 80 7300 8880 8001; do check "escucha en TCP $p" listening "$p"; done
+check "bhttp-server solo en 127.0.0.1:18022" bash -c '[[ "$(ss -Hltn "sport = :18022" | awk "{print \$4}")" == 127.0.0.1:18022 ]]'
+check "HCR y BHTTP apuntan al mismo SSH que PDirect-C (22)" \
+  bash -c 'grep -qx HCR_SSH_PORT=22 /etc/vpsarg-hcr.conf && grep -qx BHTTP_SSH_PORT=22 /etc/vpsarg-bhttp.conf && grep -qx SSH_PORT=22 /etc/vpsarg-pdirect.conf'
+check "token consumido en el servicio" test "$(db_state "$ID")" = consumido
+check "informa que el token se consumió" grep -q "Token $ID consumido" "$W/completa.log"
+check "registro local 0600 con el id y estado instalada (sin el token)" \
+  bash -c '[[ "$(stat -c %a /etc/vpsarg/instalacion)" == 600 ]] && grep -qx "token_id=$1" /etc/vpsarg/instalacion && grep -qx estado=instalada /etc/vpsarg/instalacion && ! grep -qF "$2" /etc/vpsarg/instalacion' _ "$ID" "$T"
+check "el token no aparece en la salida (lectura sin eco)" bash -c '! grep -qF -- "${1#vpsarg_}" "$2"' _ "$T" "$W/completa.log"
+check "el token no aparece en la lista de procesos" bash -c '! grep -qF -- "${1#vpsarg_}" "$2"' _ "$T" "$W/ps.txt"
+check "el token no aparece en journal, /var/log, /etc, /usr/local ni /var/backups" \
+  bash -c '! journalctl -o cat | grep -qF -- "${1#vpsarg_}" && ! grep -rqF -- "${1#vpsarg_}" /var/log /etc /usr/local /var/backups 2>/dev/null' _ "$T"
+check "registro en el journal con el id" bash -c 'journalctl -t vpsarg-instalador -o cat | grep -q "token_id=$1 resultado=instalada"' _ "$ID"
+check "no queda la marca de instalación en curso" test ! -e /run/vpsarg-instalacion
+check "el instalador no deja el cliente del token en la VPS" test ! -e /usr/local/lib/vpsarg/token.sh
+check "ninguna parte instalada lee el token" \
+  bash -c '! grep -l -e VPSARG_TOKEN -e token.sh /usr/local/sbin/vpsarg* /etc/systemd/system/{pdirect-80,udpgw-7300,hcr-8880,bhttp-server,bhttp-shim}.service 2>/dev/null | grep -q .'
+rejected reusar "El token ya se usó en otra instalación" "$T"
+check "reusar: sigue consumido" test "$(db_state "$ID")" = consumido
 
-echo "### vpsarg-hcr instalar exige un token con HCR, no usado"
-hcr_rejected hcr-sin-token "Falta el token de instalación" ""
-hcr_rejected hcr-token-base "El token no incluye HCR" "$(tok lab-base-2 base)"
-hcr_rejected hcr-token-usado "El token lab-001 ya se usó en esta VPS" "$(sign_raw "id=lab-001"$'\n'"vence=$TODAY"$'\n'"alcance=base,hcr")"
-hcr_rejected hcr-vencido "venció el $YESTERDAY" "$(tok lab-hcr-2 base,hcr "$YESTERDAY")"
-BEFORE="$(state)"
-vpsarg-hcr verificar > "$W/verificar.log" 2>&1
-RC=$?
-check "vpsarg-hcr verificar: OK sin token (rc=$RC)" grep -q "OK: HCR se puede instalar" "$W/verificar.log"
-check "vpsarg-hcr verificar no cambia nada" diff <(echo "$BEFORE") <(state)
-PD0="$(pid_of pdirect-80)"; UG0="$(pid_of udpgw-7300)"
-HCR2="$(tok lab-hcr-2 base,hcr)"
-VPSARG_TOKEN="$HCR2" setsid -w vpsarg-hcr instalar </dev/null > "$W/hcr-instalar.log" 2>&1
-check "token con HCR: vpsarg-hcr instalar funciona (rc=$?)" systemctl is-active --quiet hcr-8880
-check "HCR: id registrado como usado" grep -q "^id=lab-hcr-2 uso=hcr " "$USED"
-check "HCR: PDirect-C y UDPGW no se reiniciaron" test "$(pid_of pdirect-80) $(pid_of udpgw-7300)" = "$PD0 $UG0"
-check "HCR: huella de PDirect-C y UDPGW igual" diff <(echo "$BASE_UNITS") <(sha256sum /etc/systemd/system/pdirect-80.service /etc/systemd/system/udpgw-7300.service /usr/local/bin/pdirect-c /etc/vpsarg-pdirect.conf)
-check "HCR: estado, detener e iniciar no piden token" bash -c 'vpsarg-hcr estado </dev/null >/dev/null && vpsarg-hcr detener </dev/null >/dev/null && vpsarg-hcr iniciar </dev/null >/dev/null'
-vpsarg-hcr desinstalar >/dev/null 2>&1
-hcr_rejected hcr-reusar "El token lab-hcr-2 ya se usó en esta VPS" "$HCR2"
-check "HCR sigue sin instalar tras el rechazo" hcr_absent
+echo "### Reinstalar encima con un token nuevo (con otro puerto de BHTTP)"
+new_token
+install_run reinstalar "$T" 'SI\n\n8005\n'
+check "reinstalar: rc=0 (rc=$RC)" test "$RC" = 0
+check "reinstalar: BHTTP en 8005 y ya no en 8001" bash -c 'listening 8005 && ! listening 8001 && grep -qx BHTTP_PORT=8005 /etc/vpsarg-bhttp.conf'
+check "reinstalar: token consumido" test "$(db_state "$ID")" = consumido
+vpsarg-bhttp puerto 8001 >/dev/null
+check "vuelta a 8001 con vpsarg-bhttp puerto" listening 8001
 
-echo "### install.sh con token base,hcr: base y HCR en la misma corrida"
-HCR3="$(tok lab-hcr-3 base,hcr)"
-install_tty completo "$HCR3"
-check "token base,hcr: instalación rc=0 (rc=$RC)" test "$RC" = 0
-check "token base,hcr: HCR activo" systemctl is-active --quiet hcr-8880
-check "token base,hcr: HCR sin root y en 8880 -> 127.0.0.1:22" bash -c 'p=$(systemctl show -p MainPID --value hcr-8880); [[ "$(ps -o uid= -p "$p" | tr -d " ")" != 0 ]] && ss -Hltnp "sport = :8880" | grep -q "pid=$p," && tr "\0" " " < /proc/$p/cmdline | grep -q -- "-target 127.0.0.1:22 "'
-check "token base,hcr: id registrado para hcr y para base" bash -c 'grep -q "^id=lab-hcr-3 uso=hcr " "$1" && grep -q "^id=lab-hcr-3 uso=base " "$1"' _ "$USED"
-check "token base,hcr: unidades, PDirect-C y destino iguales" diff <(echo "$BASE_UNITS") <(sha256sum /etc/systemd/system/pdirect-80.service /etc/systemd/system/udpgw-7300.service /usr/local/bin/pdirect-c /etc/vpsarg-pdirect.conf)
-check "el token no aparece en journal, /var/log, /etc ni /usr/local" bash -c 'for t; do ! journalctl -o cat | grep -qF -- "${t#vpsarg1.}" && ! grep -rqF -- "${t#vpsarg1.}" /var/log /etc /usr/local 2>/dev/null || exit 1; done' _ "$GOOD" "$HCR2" "$HCR3"
-vpsarg-hcr desinstalar >/dev/null 2>&1
-hcr_rejected hcr-reusar-completo "El token lab-hcr-3 ya se usó en esta VPS" "$HCR3"
+echo "### Fallo a mitad de una reinstalación: vuelve la instalación anterior, funcionando"
+mkdir -p "$W/falla-hcr"; cp "$W/src/"* "$W/falla-hcr/"
+python3 - "$W/falla-hcr/vpsarg-hcr.sh" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+a = "cmd_instalar() {\n  require_authorized\n"
+assert a in s
+open(p, "w").write(s.replace(a, a + '  fail "falla de prueba en la instalación de HCR"\n'))
+PY
+FULL="$(state)"
+new_token
+install_run falla-reinstalar "$T" 'SI\n\n\n' "$W/falla-hcr/install.sh"
+check "falla-reinstalar: termina con error (rc=$RC)" test "$RC" -ne 0
+check "falla-reinstalar: informa el paso que falló" grep -q "falló la instalación en el paso: instalar HCR" "$W/falla-reinstalar.log"
+check "falla-reinstalar: informa la reversión completa" grep -q "Reversión completa" "$W/falla-reinstalar.log"
+sleep 2
+check "falla-reinstalar: archivos, servicios y puertos como antes" diff <(echo "$FULL") <(state)
+check "falla-reinstalar: el controlador de HCR es el de antes (no el de prueba)" \
+  bash -c '! grep -q "falla de prueba" /usr/local/sbin/vpsarg-hcr'
+check "falla-reinstalar: el token no se consumió" test "$(db_state "$ID")" = emitido
+check "falla-reinstalar: PDirect-C llega a SSH" timeout 6 bash -c 'exec 3<>/dev/tcp/127.0.0.1/80; printf "GET / HTTP/1.1\r\nHost: x\r\n\r\n" >&3; for _ in 1 2 3 4 5 6 7 8; do IFS= read -r -t 4 l <&3 || exit 1; [[ "$l" == SSH-* ]] && exit 0; done; exit 1'
+install_run reintento "$T" 'SI\n\n\n'
+check "el mismo token sirve para reintentar después de la reversión (rc=$RC)" test "$RC" = 0
+check "reintento: token consumido" test "$(db_state "$ID")" = consumido
 
-echo "### Después de instalar, nada consulta el token"
-check "PDirect-C, UDPGW y las cuentas no leen el token" bash -c '! grep -l -e VPSARG_TOKEN -e token.sh -e tokens-usados /usr/local/sbin/vpsarg /usr/local/sbin/vpsarg-puertos /usr/local/sbin/vpsarg-usuarios /usr/local/bin/pdirect-c 2>/dev/null | grep -q .'
-check "unidades sin referencias al token" bash -c '! grep -qi token /etc/systemd/system/pdirect-80.service /etc/systemd/system/udpgw-7300.service'
+echo "### Componentes sueltos sin instalación autorizada"
+mv /etc/vpsarg/instalacion "$W/instalacion"
+check "vpsarg-hcr instalar se niega" bash -c 'vpsarg-hcr instalar 2>&1 | grep -q "HCR se instala con install.sh y un token"'
+check "vpsarg-bhttp instalar se niega" bash -c 'vpsarg-bhttp instalar 2>&1 | grep -q "BHTTP se instala con install.sh y un token"'
+mv "$W/instalacion" /etc/vpsarg/instalacion
 
-rm -rf "$W/clave" "$W/otra"
+rm -rf "$W/falso" "$W/bh-mod" "$W/bh-falta"
 echo
 echo "Resultado: $PASS pasan, $FAILS fallan"
 ((FAILS == 0))

@@ -1,28 +1,25 @@
 # shellcheck shell=bash
-# VPS ARG QuickStart - verificador del token de instalación.
-# Se carga con "source" desde install.sh y desde vpsarg-hcr; quien lo carga define fail().
-# Se instala en /usr/local/lib/vpsarg/token.sh. No ejecuta nada al cargarse.
+# VPS ARG QuickStart - cliente del servicio de autorización de instalaciones.
+# Se carga con "source" desde install.sh; quien lo carga define fail().
+# No ejecuta nada al cargarse.
 #
-# Token: vpsarg1.<datos en base64url>.<firma ECDSA P-256 / SHA-256 en base64url>
-# Datos (una por línea): id=..., vence=AAAA-MM-DD, alcance=base|base,hcr (opcional: base), nota=... (opcional).
-# Solo autoriza instalar. No interviene en el login de los usuarios ni en los servicios.
-# La clave privada nunca está en el repositorio ni en la VPS (herramientas/emitir-token.sh).
+# Un token (vpsarg_ + 43 caracteres) autoriza UNA instalación completa:
+#   token_reserve  -> el servicio lo reserva para esta VPS (nadie más puede usarlo)
+#   token_release  -> la instalación no empezó o se revirtió: el token vuelve a estar disponible
+#   token_confirm  -> la instalación terminó bien: el token queda consumido para siempre
+# El token viaja solo por HTTPS en el cuerpo del pedido (por stdin de curl, no aparece en ps).
+# Nunca se guarda en disco ni en registros. Solo autoriza instalar: no interviene en el
+# login de los usuarios ni en los servicios instalados.
 
+# Dirección del servicio de autorización (https://...). Vacía hasta que se configure.
+VPSARG_AUTH_URL=""
+VPSARG_INSTALL_RECORD="/etc/vpsarg/instalacion"
 # shellcheck disable=SC2034  # las variables TOKEN_* las usa quien carga este archivo
-VPSARG_TOKEN_PUBKEY=""
-VPSARG_TOKENS_USED="/etc/vpsarg/tokens-usados"
 TOKEN=""
 TOKEN_ID=""
-TOKEN_EXPIRES=""
-TOKEN_SCOPE=""
-TOKEN_NOTE=""
-
-token_b64url_decode() {
-  local s="${1//-/+}"
-  s="${s//_//}"
-  while (( ${#s} % 4 )); do s+="="; done
-  printf '%s' "$s" | base64 -d 2>/dev/null || true
-}
+RESERVA_ID=""
+TOKEN_RESP=""
+TOKEN_HTTP=""
 
 # Lee el token de VPSARG_TOKEN o de la terminal (sin eco). Nunca de un argumento.
 token_read() {
@@ -35,58 +32,97 @@ token_read() {
   [[ -n "$TOKEN" ]] || fail "Falta el token de instalación (escribilo cuando se pida o usá VPSARG_TOKEN). No se realizaron cambios."
 }
 
-token_used() {
-  [[ -r "$VPSARG_TOKENS_USED" ]] && grep -q "^id=$1 " "$VPSARG_TOKENS_USED"
+token_url() {
+  # Laboratorio: solo junto con una copia local del repositorio (VPSARG_SRC_DIR).
+  if [[ -n "${VPSARG_SRC_DIR:-}" && -n "${VPSARG_LAB_AUTH_URL:-}" ]]; then
+    echo "$VPSARG_LAB_AUTH_URL"
+  else
+    echo "$VPSARG_AUTH_URL"
+  fi
 }
 
-# token_verify ALCANCE: verifica firma, datos, vencimiento, alcance y que no se haya usado en esta VPS.
-# No cambia nada del sistema. Deja TOKEN_ID, TOKEN_EXPIRES, TOKEN_SCOPE y TOKEN_NOTE.
-token_verify() {
-  local need="$1" payload sig tmp ok=0 data line
-  [[ -n "$VPSARG_TOKEN_PUBKEY" ]] || fail "Este instalador no tiene configurada la clave pública de tokens. No se realizaron cambios."
-  command -v openssl >/dev/null 2>&1 || fail "Falta openssl para verificar el token. No se realizaron cambios."
-  if (( ${#TOKEN} > 1024 )) || [[ ! "$TOKEN" =~ ^vpsarg1\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)$ ]]; then
-    fail "El token no tiene un formato válido. No se realizaron cambios."
-  fi
-  payload="${BASH_REMATCH[1]}"
-  sig="${BASH_REMATCH[2]}"
-  tmp="$(mktemp -d)"
-  printf '%s\n' "$VPSARG_TOKEN_PUBKEY" > "$tmp/pub.pem"
-  printf 'vpsarg1.%s' "$payload" > "$tmp/msg"
-  token_b64url_decode "$sig" > "$tmp/sig"
-  openssl dgst -sha256 -verify "$tmp/pub.pem" -signature "$tmp/sig" "$tmp/msg" >/dev/null 2>&1 && ok=1
-  rm -rf -- "$tmp"
-  ((ok)) || fail "La firma del token no es válida. No se realizaron cambios."
-
-  TOKEN_ID="" TOKEN_EXPIRES="" TOKEN_SCOPE="base" TOKEN_NOTE=""
-  data="$(token_b64url_decode "$payload")"
-  while IFS= read -r line; do
-    case "$line" in
-      id=*) TOKEN_ID="${line#id=}" ;;
-      vence=*) TOKEN_EXPIRES="${line#vence=}" ;;
-      alcance=*) TOKEN_SCOPE="${line#alcance=}" ;;
-      nota=*) TOKEN_NOTE="${line#nota=}" ;;
-      *) fail "El token tiene datos desconocidos. No se realizaron cambios." ;;
-    esac
-  done <<< "$data"
-  [[ "$TOKEN_ID" =~ ^[A-Za-z0-9_-]{1,40}$ ]] || fail "El token no tiene un id válido. No se realizaron cambios."
-  [[ "$TOKEN_NOTE" =~ ^[A-Za-z0-9\ ._@-]{0,60}$ ]] || fail "El token tiene una nota no válida. No se realizaron cambios."
-  [[ "$TOKEN_SCOPE" == base || "$TOKEN_SCOPE" == base,hcr ]] || fail "El token tiene un alcance no válido. No se realizaron cambios."
-  if [[ ! "$TOKEN_EXPIRES" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || ! date -u -d "$TOKEN_EXPIRES" >/dev/null 2>&1; then
-    fail "El token no tiene una fecha de vencimiento válida. No se realizaron cambios."
-  fi
-  [[ "$(date -u +%F)" > "$TOKEN_EXPIRES" ]] && fail "El token venció el $TOKEN_EXPIRES. No se realizaron cambios."
-  if [[ "$need" == hcr && "$TOKEN_SCOPE" != base,hcr ]]; then
-    fail "El token no incluye HCR (alcance: $TOKEN_SCOPE). No se realizaron cambios."
-  fi
-  token_used "$TOKEN_ID" && fail "El token $TOKEN_ID ya se usó en esta VPS. Pedí uno nuevo. No se realizaron cambios."
-  echo "Token válido: $TOKEN_ID${TOKEN_NOTE:+ ($TOKEN_NOTE)}, alcance $TOKEN_SCOPE, vence el $TOKEN_EXPIRES."
+# Valor de un campo de texto simple de la respuesta JSON del servicio.
+token_field() {
+  sed -n "s/.*\"$1\": *\"\([A-Za-z0-9_-]*\)\".*/\1/p" <<< "$TOKEN_RESP" | head -n 1
 }
 
-# token_mark_used USO: registra el id (nunca el token) como usado en esta VPS.
-token_mark_used() {
-  install -d -o root -g root -m 0700 "${VPSARG_TOKENS_USED%/*}"
-  (umask 077; printf 'id=%s uso=%s vence=%s fecha=%s\n' "$TOKEN_ID" "$1" "$TOKEN_EXPIRES" "$(date -u +%FT%TZ)" >> "$VPSARG_TOKENS_USED")
-  chmod 0600 "$VPSARG_TOKENS_USED"
-  logger -t vpsarg-instalador "token_id=$TOKEN_ID uso=$1 vence=$TOKEN_EXPIRES resultado=instalado" 2>/dev/null || true
+# token_post RUTA JSON: deja la respuesta en TOKEN_RESP y el código HTTP en TOKEN_HTTP.
+token_post() {
+  local out
+  TOKEN_RESP="" TOKEN_HTTP=""
+  out="$(printf '%s' "$2" | curl -sS --max-time 20 --proto =https,http -H 'Content-Type: application/json' \
+           --data-binary @- -w '\n%{http_code}' "$(token_url)$1" 2>/dev/null)" || return 1
+  TOKEN_HTTP="${out##*$'\n'}"
+  TOKEN_RESP="${out%$'\n'*}"
+}
+
+token_hostname() {
+  hostname 2>/dev/null | tr -cd 'A-Za-z0-9.-' | cut -c1-64
+}
+
+# Reserva el token para esta instalación. No cambia nada del sistema.
+token_reserve() {
+  local url motivo
+  url="$(token_url)"
+  [[ -n "$url" ]] || fail "Este instalador no tiene configurado el servicio de autorización. No se realizaron cambios."
+  [[ "$url" == https://* || ( -n "${VPSARG_SRC_DIR:-}" && "$url" == http://127.0.0.1:* ) ]] \
+    || fail "El servicio de autorización debe usar https. No se realizaron cambios."
+  command -v curl >/dev/null 2>&1 || fail "Falta curl para validar el token (apt-get install curl). No se realizaron cambios."
+  [[ "$TOKEN" =~ ^vpsarg_[A-Za-z0-9_-]{43}$ ]] || fail "El token no tiene un formato válido. No se realizaron cambios."
+  token_post /v1/reservar "{\"token\":\"$TOKEN\",\"hostname\":\"$(token_hostname)\"}" \
+    || fail "No se pudo contactar el servicio de autorización. No se realizaron cambios."
+  if [[ "$TOKEN_HTTP" == 200 && "$(token_field resultado)" == reservado ]]; then
+    TOKEN_ID="$(token_field token_id)"
+    RESERVA_ID="$(token_field reserva_id)"
+    [[ "$TOKEN_ID" =~ ^[A-Za-z0-9_-]{1,40}$ && "$RESERVA_ID" =~ ^[A-Za-z0-9_-]{22}$ ]] \
+      || fail "Respuesta inesperada del servicio de autorización. No se realizaron cambios."
+    echo "Token válido ($TOKEN_ID): reservado para esta instalación."
+    return 0
+  fi
+  motivo="$(token_field motivo)"
+  case "$motivo" in
+    invalido) fail "El token no es válido. No se realizaron cambios." ;;
+    vencido) fail "El token venció. Pedí uno nuevo. No se realizaron cambios." ;;
+    revocado) fail "El token fue revocado. No se realizaron cambios." ;;
+    consumido) fail "El token ya se usó en otra instalación. Pedí uno nuevo. No se realizaron cambios." ;;
+    en_uso) fail "El token está reservado por otra instalación en curso. No se realizaron cambios." ;;
+    demasiados_pedidos) fail "Demasiados intentos. Esperá un minuto. No se realizaron cambios." ;;
+    *) fail "El servicio de autorización no aceptó el pedido (HTTP ${TOKEN_HTTP:-?}). No se realizaron cambios." ;;
+  esac
+}
+
+# Devuelve el token al estado disponible (la instalación no empezó o se revirtió).
+token_release() {
+  [[ -n "$RESERVA_ID" ]] || return 0
+  if token_post /v1/liberar "{\"token\":\"$TOKEN\",\"reserva_id\":\"$RESERVA_ID\"}" \
+     && [[ "$TOKEN_HTTP" == 200 ]]; then
+    echo "El token quedó disponible otra vez."
+  else
+    echo "AVISO: no se pudo liberar el token; vuelve a estar disponible solo en 30 minutos." >&2
+  fi
+  RESERVA_ID=""
+}
+
+# Marca el token como consumido. Reintenta ante fallos de red.
+token_confirm() {
+  local _
+  for _ in 1 2 3 4 5; do
+    if token_post /v1/confirmar "{\"token\":\"$TOKEN\",\"reserva_id\":\"$RESERVA_ID\"}" \
+       && [[ "$TOKEN_HTTP" == 200 && "$(token_field resultado)" == consumido ]]; then
+      RESERVA_ID=""
+      return 0
+    fi
+    [[ "$TOKEN_HTTP" == 403 ]] && return 1
+    sleep 3
+  done
+  return 1
+}
+
+# Registra en esta VPS el id del token (nunca el token) y la fecha.
+token_record() {
+  install -d -o root -g root -m 0700 "${VPSARG_INSTALL_RECORD%/*}"
+  (umask 077; printf 'token_id=%s\nfecha=%s\nestado=%s\n' "$TOKEN_ID" "$(date -u +%FT%TZ)" "$1" \
+     > "$VPSARG_INSTALL_RECORD")
+  chmod 0600 "$VPSARG_INSTALL_RECORD"
+  logger -t vpsarg-instalador "token_id=$TOKEN_ID resultado=$1" 2>/dev/null || true
 }
